@@ -1,0 +1,21 @@
+# Секреты и личные данные — НЕ заливать
+config.json
+*.session
+*.session-journal
+prompt.txt
+
+# Рабочие файлы программы
+log.txt
+done_posts.txt
+_system_prompt.txt
+_post_media/
+
+# Свои картинки (папка остаётся пустой)
+images/*
+!images/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

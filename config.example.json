@@ -1,0 +1,28 @@
+{
+  "api_id": 1234567,
+  "api_hash": "ВАШ_API_HASH",
+  "session_name": "my_account",
+  "channel": "username_канала_без_собачки",
+  "model": "sonnet",
+  "prompt_file": "prompt.txt",
+  "images_dir": "images",
+  "attach_image_chance": 1.0,
+  "delay_min_sec": 20,
+  "delay_max_sec": 90,
+  "confirm_before_post": true,
+  "skip_keywords": [
+    "погиб",
+    "умер",
+    "скончал",
+    "теракт",
+    "катастроф",
+    "траур",
+    "соболезн",
+    "жертв",
+    "пожар",
+    "убит"
+  ],
+  "claude_timeout_sec": 120,
+  "send_post_images": false,
+  "max_post_images": 4
+}
