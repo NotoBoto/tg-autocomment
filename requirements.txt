@@ -1,2 +1,7 @@
 telethon>=1.36
 qrcode>=7.4
+customtkinter>=5.2
+pillow>=10.0
+anthropic>=1.11
+google-genai>=1.0
+openai>=1.66

@@ -1,0 +1,1139 @@
+"""
+Ядро автокомментатора: настройки, генерация через Claude Code, работа с Telegram.
+Telegram-клиент живёт в отдельном потоке со своим asyncio-циклом, а наружу (в окно)
+отдаёт события через очередь.
+"""
+import asyncio
+import base64
+import json
+import logging
+import mimetypes
+import os
+import queue
+import random
+import re
+import shutil
+import subprocess
+import threading
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from telethon import TelegramClient, events, errors
+
+BASE = Path(__file__).parent
+CONFIG_FILE = BASE / "config.json"
+DONE_FILE = BASE / "done_posts.txt"
+MEDIA_DIR = BASE / "_post_media"
+# Промпт передаём файлом: многострочный текст в аргументах ломается в cmd.exe
+SYSTEM_PROMPT_FILE = BASE / "_system_prompt.txt"
+
+IMAGE_EXT = {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".gif", ".bmp", ".mp4"}
+MODELS = ["sonnet", "opus", "haiku"]          # для Claude Code
+API_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"]
+API_PRICES = {  # $ за 1M токенов: вход / выход
+    "claude-opus-5-5": "$4 / $20", "claude-sonnet-5-5": "$2 / $10", "claude-haiku-4-5": "$1 / $5"}
+GEMINI_API_DEFAULT = "gemini-flash-latest"
+
+# Страховка поверх вашего промпта: модель сама отказывается от тяжёлых тем
+SKIP_RULE = (
+    "\n\nВАЖНО: если пост о смерти, трагедии, катастрофе, болезни, войне "
+    "или другой тяжёлой теме — ответь ровно одним словом SKIP."
+)
+
+DEFAULTS = {
+    "api_id": "",
+    "api_hash": "",
+    "session_name": "my_account",
+    "channel": "",
+    "backend": "claude_code",      # claude_code | api (Anthropic) | gemini_cli (Antigravity) | gemini_api | codex | openai_api
+    "model": "sonnet",
+    "api_key": "",
+    "api_model": "claude-opus-5-5",
+    "gemini_model": "",            # модель Antigravity; пусто — по умолчанию
+    "gemini_api_key": "",
+    "gemini_api_model": "gemini-flash-latest",
+    "codex_model": "",             # модель Codex; пусто — по умолчанию для аккаунта
+    "openai_api_key": "",
+    "openai_api_model": "gpt-5.5",
+    "prompt_file": "prompt.txt",
+    "images_dir": "images",
+    "attach_image_chance": 1.0,
+    "delay_min_sec": 20,
+    "delay_max_sec": 90,
+    "confirm_before_post": True,
+    "skip_keywords": ["погиб", "умер", "скончал", "теракт", "катастроф",
+                      "траур", "соболезн", "жертв", "пожар", "убит"],
+    "claude_timeout_sec": 120,
+    "send_post_images": False,
+    "max_post_images": 4,
+}
+
+log = logging.getLogger("autocomment")
+
+
+# ---------- настройки ----------
+
+def load_config() -> dict:
+    cfg = dict(DEFAULTS)
+    if CONFIG_FILE.exists():
+        try:
+            cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
+        except json.JSONDecodeError as e:
+            log.error("config.json повреждён (%s) — взяты значения по умолчанию", e)
+    return cfg
+
+
+def save_config(cfg: dict):
+    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def normalize_channel(s: str) -> str:
+    """'@name', 't.me/name', 'https://t.me/name/123' -> 'name'."""
+    s = s.strip()
+    m = re.search(r"t\.me/(?:s/)?([A-Za-z0-9_]+)", s)
+    if m:
+        return m.group(1)
+    return s.lstrip("@")
+
+
+def prompt_path(cfg) -> Path:
+    return BASE / cfg["prompt_file"]
+
+
+def images_path(cfg) -> Path:
+    p = Path(cfg["images_dir"])
+    return p if p.is_absolute() else BASE / p
+
+
+def list_images(cfg) -> list[Path]:
+    folder = images_path(cfg)
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.iterdir()
+                  if p.is_file() and p.suffix.lower() in IMAGE_EXT)
+
+
+# Сюда ставит официальный установщик; PATH у уже запущенной программы об этом не знает
+NATIVE_CLAUDE = Path.home() / ".local" / "bin" / "claude.exe"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def find_claude() -> str | None:
+    # На Windows предпочитаем настоящий .exe, а не обёртку .cmd
+    found = shutil.which("claude.exe") or shutil.which("claude")
+    if found:
+        return found
+    return str(NATIVE_CLAUDE) if NATIVE_CLAUDE.exists() else None
+
+
+def claude_status() -> dict:
+    """{'installed', 'loggedIn', 'email', 'authMethod', 'subscriptionType'}"""
+    exe = find_claude()
+    if not exe:
+        return {"installed": False, "loggedIn": False}
+    try:
+        r = subprocess.run([exe, "auth", "status", "--json"], capture_output=True,
+                           timeout=30, creationflags=NO_WINDOW)
+        info = json.loads(decode_any(r.stdout))
+    except Exception:
+        info = {"loggedIn": False}
+    info["installed"] = True
+    return info
+
+
+def api_key(cfg) -> str | None:
+    return str(cfg.get("api_key", "")).strip() or os.environ.get("ANTHROPIC_API_KEY")
+
+
+def check_api_key(cfg) -> tuple[bool, str]:
+    """Проверка ключа без траты токенов: запрашиваем описание выбранной модели."""
+    import anthropic
+    key = api_key(cfg)
+    if not key:
+        return False, "Ключ не указан"
+    try:
+        m = anthropic.Anthropic(api_key=key, timeout=20, max_retries=1).models.retrieve(
+            cfg.get("api_model", API_MODELS[0]))
+        return True, f"Ключ работает ✓  модель {m.display_name} доступна"
+    except anthropic.AuthenticationError:
+        return False, "Ключ не подходит"
+    except anthropic.NotFoundError:
+        return False, "Ключ работает, но модель недоступна для этого аккаунта"
+    except anthropic.APIConnectionError:
+        return False, "Нет связи с API — проверьте интернет"
+    except anthropic.APIStatusError as e:
+        return False, f"Ошибка API ({e.status_code}): {e.message}"
+
+
+def install_claude() -> tuple[bool, str]:
+    """Официальный установщик Claude Code для Windows (Node.js не нужен)."""
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+         "irm https://claude.ai/install.ps1 | iex"],
+        capture_output=True, timeout=600, creationflags=NO_WINDOW)
+    out = (decode_any(r.stdout) + "\n" + decode_any(r.stderr)).strip()
+    return find_claude() is not None, out
+
+
+def open_claude_login():
+    """Открывает вход в отдельном окне консоли: там ссылка/браузер и, если нужно, поле для кода."""
+    subprocess.Popen([find_claude(), "auth", "login", "--claudeai"],
+                     creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+
+
+def validate(cfg) -> list[str]:
+    """Список понятных проблем, мешающих запуску."""
+    problems = []
+    if not str(cfg.get("api_id", "")).strip().isdigit():
+        problems.append("Не указан API ID (число с my.telegram.org)")
+    if not str(cfg.get("api_hash", "")).strip():
+        problems.append("Не указан API Hash (с my.telegram.org)")
+    if not cfg.get("channel"):
+        problems.append("Не указан канал")
+    p = prompt_path(cfg)
+    if not p.exists() or not p.read_text(encoding="utf-8").strip():
+        problems.append("Промпт пустой — заполните вкладку «Промпт»")
+    backend = cfg.get("backend")
+    if backend == "api":
+        if not api_key(cfg):
+            problems.append("Не указан API-ключ Anthropic — «Настройки» → «Нейросеть»")
+        return problems
+    if backend == "gemini_api":
+        if not gemini_key(cfg):
+            problems.append("Не указан API-ключ Gemini — «Настройки» → «Нейросеть»")
+        return problems
+    if backend == "openai_api":
+        if not openai_key(cfg):
+            problems.append("Не указан API-ключ OpenAI — «Настройки» → «Нейросеть»")
+        return problems
+    if backend == "codex":
+        st = codex_status()
+        if not st["installed"]:
+            problems.append("Не установлен Codex CLI — «Настройки» → «Установить и войти»")
+        elif not st["loggedIn"]:
+            problems.append("Не выполнен вход в ChatGPT — «Настройки» → «Войти в ChatGPT»")
+        return problems
+    if backend == "gemini_cli":
+        st = agy_status()
+        if not st["installed"]:
+            problems.append("Не установлен Antigravity CLI — «Настройки» → «Установить и войти»")
+        elif not st["loggedIn"]:
+            problems.append("Не выполнен вход в Google для Antigravity — «Настройки» → «Войти в Google»")
+        return problems
+    st = claude_status()
+    if not st["installed"]:
+        problems.append("Не установлен Claude Code — «Настройки» → «Установить и войти»")
+    elif not st.get("loggedIn"):
+        problems.append("Не выполнен вход в Claude — «Настройки» → «Войти в Claude»")
+    return problems
+
+
+def decode_any(data: bytes) -> str:
+    """Windows-консоль может отдавать ошибки в cp866/cp1251 — пробуем все."""
+    for enc in ("utf-8", "cp866", "cp1251"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+# ---------- Antigravity CLI (Google, преемник Gemini CLI) ----------
+# С 18.06.2026 Gemini CLI не обслуживает личные Google-аккаунты — вместо него agy.
+
+AGY_DEFAULT = Path(os.environ.get("LOCALAPPDATA", "")) / "agy" / "bin" / "agy.exe"
+AGY_WORKSPACE = BASE / "_agy_workspace"   # пустая папка: agy не видит файлы проекта
+AGY_AGENT = "autocomment"
+
+
+def find_agy() -> str | None:
+    found = shutil.which("agy.exe") or shutil.which("agy")
+    if found:
+        return found
+    return str(AGY_DEFAULT) if AGY_DEFAULT.exists() else None
+
+
+def agy_status() -> dict:
+    """`agy models` без входа сразу отвечает «Please sign in», после входа — списком моделей."""
+    exe = find_agy()
+    if not exe:
+        return {"installed": False, "loggedIn": False}
+    try:
+        r = subprocess.run([exe, "models"], capture_output=True, timeout=40,
+                           stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        out = decode_any(r.stdout) + decode_any(r.stderr)
+    except subprocess.TimeoutExpired:
+        return {"installed": True, "loggedIn": False}
+    if "sign in" in out.lower() or "authentication required" in out.lower():
+        return {"installed": True, "loggedIn": False}
+    # Строки вида «gemini-3.8-flash-medium<TAB>Gemini 3.8 Flash (Medium)»; есть и Claude, и GPT
+    models = [line.split("\t")[0].strip() for line in out.splitlines() if "\t" in line]
+    return {"installed": True, "loggedIn": r.returncode == 0, "models": list(dict.fromkeys(models))}
+
+
+def install_agy() -> tuple[bool, str]:
+    """Официальный установщик Antigravity CLI для Windows."""
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+         "irm https://antigravity.google/cli/install.ps1 | iex"],
+        capture_output=True, timeout=600, creationflags=NO_WINDOW)
+    out = (decode_any(r.stdout) + "\n" + decode_any(r.stderr)).strip()
+    return find_agy() is not None, out
+
+
+def open_agy_login():
+    """Первый запуск agy без аргументов открывает браузер для входа в Google-аккаунт."""
+    subprocess.Popen([find_agy()], cwd=str(Path.home()),
+                     creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+
+
+# ---------- Gemini API ----------
+
+def gemini_key(cfg) -> str | None:
+    return (str(cfg.get("gemini_api_key", "")).strip()
+            or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+
+
+def check_gemini_key(cfg) -> tuple[bool, str, list[str]]:
+    """Проверка ключа без траты токенов: получаем список доступных моделей."""
+    from google import genai
+    from google.genai import errors as gerr
+    key = gemini_key(cfg)
+    if not key:
+        return False, "Ключ не указан", []
+    try:
+        client = genai.Client(api_key=key)
+        models = sorted(m.name.removeprefix("models/") for m in client.models.list()
+                        if "generateContent" in (m.supported_actions or []) and "gemini" in m.name)
+    except gerr.APIError as e:
+        if e.code in (400, 401, 403):
+            return False, "Ключ не подходит", []
+        return False, f"Ошибка API ({e.code}): {e.message}", []
+    except Exception as e:
+        return False, f"Нет связи с Gemini API: {e}", []
+    model = cfg.get("gemini_api_model") or GEMINI_API_DEFAULT
+    if model not in models:
+        return True, f"Ключ работает ✓, но модели {model} нет — выберите из списка", models
+    return True, f"Ключ работает ✓  доступно моделей: {len(models)}", models
+
+
+# ---------- ChatGPT: Codex CLI по подписке и OpenAI API по ключу ----------
+
+NPM_GLOBAL = Path(os.environ.get("APPDATA", "")) / "npm"
+NODE_DEFAULT = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "nodejs"
+CODEX_DIR = Path.home() / ".codex"
+CODEX_WORKSPACE = BASE / "_codex_workspace"   # пустая папка: Codex не видит файлы проекта
+# Лишние для комментариев возможности Codex: меньше служебного текста — меньше расход лимита
+CODEX_FEATURES_OFF = ["apps", "plugins", "multi_agent", "image_generation", "browser_use",
+                      "computer_use", "goals", "shell_tool", "unified_exec"]
+OPENAI_API_DEFAULT = "gpt-5.5"
+
+
+def find_node() -> str | None:
+    found = shutil.which("node")
+    if found:
+        return found
+    exe = NODE_DEFAULT / "node.exe"
+    return str(exe) if exe.exists() else None
+
+
+def find_codex() -> str | None:
+    """Запускаем сам codex.exe из npm-пакета, минуя codex.cmd: cmd.exe портит кириллицу в аргументах."""
+    roots = [NPM_GLOBAL / "node_modules" / "@openai"]
+    if shutil.which("codex"):
+        roots.append(Path(shutil.which("codex")).parent / "node_modules" / "@openai")
+    for root in roots:
+        for pattern in ("codex/node_modules/@openai/codex-win32-*/vendor/*/bin/codex.exe",
+                        "codex-win32-*/vendor/*/bin/codex.exe"):
+            found = sorted(root.glob(pattern))
+            if found:
+                return str(found[0])
+    return None
+
+
+def _codex_account() -> dict:
+    """Почта и тариф из id_token в ~/.codex/auth.json (сам токен никуда не передаём)."""
+    try:
+        auth = json.loads((CODEX_DIR / "auth.json").read_text(encoding="utf-8"))
+        payload = auth["tokens"]["id_token"].split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        plan = claims.get("https://api.openai.com/auth", {}).get("chatgpt_plan_type", "")
+        return {"email": claims.get("email", ""), "plan": plan}
+    except Exception:
+        return {}
+
+
+def codex_status() -> dict:
+    exe = find_codex()
+    if not exe:
+        return {"installed": False, "loggedIn": False}
+    try:
+        r = subprocess.run([exe, "login", "status"], capture_output=True, timeout=30,
+                           stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        out = (decode_any(r.stdout) + decode_any(r.stderr)).lower()
+    except Exception:
+        return {"installed": True, "loggedIn": False}
+    if r.returncode != 0 or "not logged in" in out:
+        return {"installed": True, "loggedIn": False}
+    st = {"installed": True, "loggedIn": True,
+          "authMethod": "chatgpt" if "chatgpt" in out else "api", **_codex_account()}
+    try:   # модели, доступные этому аккаунту
+        r = subprocess.run([exe, "debug", "models"], capture_output=True, timeout=30,
+                           stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        data = json.loads(decode_any(r.stdout))
+        st["models"] = [m["slug"] for m in data.get("models", data)
+                        if m.get("visibility") == "list" and "image" in (m.get("input_modalities") or [])]
+    except Exception:
+        pass
+    return st
+
+
+def install_codex() -> tuple[bool, str]:
+    """Node.js (если нет) через winget, затем Codex CLI через npm."""
+    out = ""
+    if not find_node():
+        r = subprocess.run(["winget", "install", "-e", "--id", "OpenJS.NodeJS.LTS", "--silent",
+                            "--accept-package-agreements", "--accept-source-agreements"],
+                           capture_output=True, timeout=900, creationflags=NO_WINDOW)
+        out += decode_any(r.stdout) + decode_any(r.stderr)
+        if not find_node():
+            return False, out + "\nНе удалось установить Node.js"
+    npm = Path(find_node()).parent / "npm.cmd"
+    r = subprocess.run([str(npm), "install", "-g", "@openai/codex"], capture_output=True,
+                       timeout=900, creationflags=NO_WINDOW)
+    out += decode_any(r.stdout) + decode_any(r.stderr)
+    return find_codex() is not None, out.strip()
+
+
+def open_codex_login():
+    """Вход через аккаунт ChatGPT. Если уже вошли — сначала выходим, чтобы сменить аккаунт."""
+    exe = find_codex()
+    if codex_status().get("loggedIn"):
+        subprocess.run([exe, "logout"], capture_output=True, timeout=30, creationflags=NO_WINDOW)
+    subprocess.Popen([exe, "login"], cwd=str(Path.home()),
+                     creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+
+
+def openai_key(cfg) -> str | None:
+    return str(cfg.get("openai_api_key", "")).strip() or os.environ.get("OPENAI_API_KEY")
+
+
+def check_openai_key(cfg) -> tuple[bool, str, list[str]]:
+    """Проверка ключа без траты токенов: получаем список доступных моделей."""
+    import openai
+    key = openai_key(cfg)
+    if not key:
+        return False, "Ключ не указан", []
+    try:
+        client = openai.OpenAI(api_key=key, timeout=20, max_retries=1)
+        models = sorted(m.id for m in client.models.list()
+                        if m.id.startswith(("gpt-", "o")) and not any(
+                            x in m.id for x in ("audio", "realtime", "tts", "transcribe", "image", "embedding", "search")))
+    except openai.AuthenticationError:
+        return False, "Ключ не подходит", []
+    except openai.APIConnectionError:
+        return False, "Нет связи с OpenAI API — проверьте интернет", []
+    except openai.APIStatusError as e:
+        return False, f"Ошибка API ({e.status_code}): {e.message}", []
+    model = cfg.get("openai_api_model") or OPENAI_API_DEFAULT
+    if model not in models:
+        return True, f"Ключ работает ✓, но модели {model} нет — выберите из списка", models
+    return True, f"Ключ работает ✓  доступно моделей: {len(models)}", models
+
+
+# ---------- пост, ожидающий решения ----------
+
+@dataclass
+class Pending:
+    key: str
+    chat_id: int
+    post_id: int
+    post_text: str
+    post_images: list[Path] = field(default_factory=list)
+    comment: str = ""
+    image: Path | None = None
+    busy: bool = False       # идёт генерация/отправка
+    error: str = ""
+
+
+# ---------- движок ----------
+
+class Engine:
+    """
+    Все публичные методы вызываются из потока окна и безопасны:
+    работа уходит в asyncio-цикл фонового потока.
+    События для окна кладутся в self.events:
+      ("status", str)                  stopped / connecting / login / running
+      ("login_needed", None)
+      ("qr", url)                      новый QR для входа
+      ("password_needed", None)        нужен облачный пароль 2FA
+      ("login_error", text)
+      ("code_sent", None)
+      ("me", name)
+      ("pending", Pending)             новый пост ждёт решения
+      ("pending_update", Pending)
+      ("pending_done", (key, result))  published / skipped
+      ("posted", None)                 счётчик опубликованных
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.events: queue.Queue = queue.Queue()
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        self.client: TelegramClient | None = None
+        self.pending: dict[str, Pending] = {}
+        self.done_posts = set(DONE_FILE.read_text().split()) if DONE_FILE.exists() else set()
+        self._image_bag: list[Path] = []
+        self._seen_groups: set[int] = set()
+        self._gen_lock: asyncio.Lock | None = None
+        self._api_client = None
+        self._api_client_key = None
+        self._gemini_client = None
+        self._gemini_client_key = None
+        self._openai_client = None
+        self._openai_client_key = None
+        self._qr_task: asyncio.Task | None = None
+        self._phone = ""
+        self.running = False
+
+    # --- служебное ---
+
+    def _emit(self, kind, data=None):
+        self.events.put((kind, data))
+
+    def _submit(self, coro):
+        fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        fut.add_done_callback(self._report_crash)
+        return fut
+
+    def _report_crash(self, fut):
+        if not fut.cancelled() and fut.exception():
+            log.error("Ошибка: %s", fut.exception())
+
+    # --- запуск / остановка / вход ---
+
+    def start(self):
+        self._submit(self._start())
+
+    def stop(self):
+        self._submit(self._stop())
+
+    async def _start(self):
+        if self.client:
+            await self._stop()
+        cfg = self.cfg
+        self._emit("status", "connecting")
+        self._gen_lock = asyncio.Lock()
+        self.client = TelegramClient(str(BASE / cfg["session_name"]),
+                                     int(cfg["api_id"]), str(cfg["api_hash"]).strip())
+        try:
+            await self.client.connect()
+        except Exception as e:
+            self.client = None
+            self._emit("status", "stopped")
+            log.error("Не удалось подключиться к Telegram: %s", e)
+            return
+        if await self.client.is_user_authorized():
+            await self._after_login()
+        else:
+            self._emit("status", "login")
+            self._emit("login_needed")
+
+    async def _stop(self):
+        if self._qr_task:
+            self._qr_task.cancel()
+            self._qr_task = None
+        if self.client:
+            await self.client.disconnect()
+            self.client = None
+        for p in list(self.pending.values()):
+            self._finish(p, "skipped")
+        if self.running:
+            log.info("Остановлено")
+        self.running = False
+        self._emit("status", "stopped")
+
+    def send_code(self, phone: str):
+        async def go():
+            self._phone = phone.strip()
+            try:
+                await self.client.send_code_request(self._phone)
+                self._emit("code_sent")
+            except Exception as e:
+                self._emit("login_error", f"Не удалось отправить код: {e}")
+        self._submit(go())
+
+    def sign_in_code(self, code: str):
+        async def go():
+            try:
+                await self.client.sign_in(self._phone, code.strip())
+            except errors.SessionPasswordNeededError:
+                self._emit("password_needed")
+                return
+            except Exception as e:
+                self._emit("login_error", f"Код не подошёл: {e}")
+                return
+            await self._after_login()
+        self._submit(go())
+
+    def sign_in_password(self, password: str):
+        async def go():
+            try:
+                await self.client.sign_in(password=password)
+            except Exception as e:
+                self._emit("login_error", f"Пароль не подошёл: {e}")
+                return
+            await self._after_login()
+        self._submit(go())
+
+    def start_qr(self):
+        async def go():
+            if not self.client:   # окно входа открыто, а подключения уже нет
+                return
+            if self._qr_task:
+                self._qr_task.cancel()
+            self._qr_task = asyncio.current_task()
+            qr = await self.client.qr_login()
+            while True:
+                self._emit("qr", qr.url)
+                try:
+                    await qr.wait(timeout=30)
+                    break
+                except asyncio.TimeoutError:
+                    await qr.recreate()
+                except errors.SessionPasswordNeededError:
+                    self._qr_task = None
+                    self._emit("password_needed")
+                    return
+            self._qr_task = None
+            await self._after_login()
+        self._submit(go())
+
+    def cancel_login(self):
+        self.stop()
+
+    async def _after_login(self):
+        cfg = self.cfg
+        me = await self.client.get_me()
+        try:
+            await self.client.get_entity(cfg["channel"])
+        except Exception as e:
+            log.error("Канал @%s не найден: %s", cfg["channel"], e)
+            await self._stop()
+            return
+        self.client.add_event_handler(self._on_new_post,
+                                      events.NewMessage(chats=cfg["channel"]))
+        self.running = True
+        self._emit("me", me.first_name)
+        self._emit("status", "running")
+        log.info("Вошли как %s, слушаю канал @%s", me.first_name, cfg["channel"])
+        log.info("Картинок для комментариев: %d", len(list_images(cfg)))
+
+    # --- картинки ---
+
+    def pick_image(self, force=False) -> Path | None:
+        """Перемешанная «колода»: каждая картинка выпадет по разу, потом новый круг."""
+        if not force and random.random() > self.cfg.get("attach_image_chance", 1.0):
+            return None
+        if not self._image_bag:
+            self._image_bag = list_images(self.cfg)
+            random.shuffle(self._image_bag)
+        return self._image_bag.pop() if self._image_bag else None
+
+    def reset_deck(self):
+        self._image_bag = []
+
+    # --- обработка постов ---
+
+    async def _collect_post(self, msg):
+        """Возвращает (id для коммента, текст, список сообщений с медиа). Склеивает альбомы."""
+        if not msg.grouped_id:
+            return msg.id, msg.raw_text or "", [msg]
+        await asyncio.sleep(2)  # даём долететь остальным частям альбома
+        around = await self.client.get_messages(msg.chat_id,
+                                                ids=list(range(msg.id - 10, msg.id + 11)))
+        parts = sorted((m for m in around if m and m.grouped_id == msg.grouped_id),
+                       key=lambda m: m.id)
+        text = next((m.raw_text for m in parts if m.raw_text), "")
+        return parts[0].id, text, parts
+
+    async def _download_post_images(self, parts, folder: Path) -> list[Path]:
+        """Качает фото (и превью видео) из поста во временную папку поста."""
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True, exist_ok=True)
+        files = []
+        for m in parts:
+            if len(files) >= self.cfg.get("max_post_images", 4):
+                break
+            target = folder / f"img{len(files) + 1}.jpg"
+            try:
+                if m.photo:
+                    path = await self.client.download_media(m, file=str(target))
+                elif m.video or m.gif:
+                    path = await self.client.download_media(m, file=str(target), thumb=-1)
+                else:
+                    continue
+                if path:
+                    files.append(Path(path))
+            except Exception as e:
+                log.warning("Не удалось скачать медиа из #%s: %s", m.id, e)
+        return files
+
+    def _is_sensitive(self, text: str) -> str | None:
+        low = text.lower()
+        return next((k for k in self.cfg.get("skip_keywords", []) if k and k.lower() in low), None)
+
+    async def _on_new_post(self, event):
+        await self._handle_post(event.message, manual=False)
+
+    def take_latest_post(self):
+        """Взять последний пост канала — удобно, чтобы проверить промпт."""
+        async def go():
+            msgs = await self.client.get_messages(self.cfg["channel"], limit=1)
+            if not msgs:
+                log.warning("В канале нет постов")
+                return
+            await self._handle_post(msgs[0], manual=True)
+        self._submit(go())
+
+    async def _handle_post(self, msg, manual: bool):
+        cfg = self.cfg
+        if msg.grouped_id and not manual:
+            if msg.grouped_id in self._seen_groups:   # альбом уже обрабатывается
+                return
+            self._seen_groups.add(msg.grouped_id)
+
+        post_id, post_text, parts = await self._collect_post(msg)
+        key = f"{msg.chat_id}:{post_id}"
+        if key in self.pending:
+            log.info("Пост #%s уже в очереди", post_id)
+            return
+        if key in self.done_posts:
+            if not manual:
+                return
+            log.warning("Под постом #%s уже есть ваш комментарий", post_id)
+        log.info("Новый пост #%s: %s", post_id, post_text[:80].replace("\n", " "))
+
+        see_images = cfg.get("send_post_images", False)
+        has_media = any(m.photo or m.video or m.gif for m in parts)
+        if not post_text.strip() and not (see_images and has_media):
+            log.info("Пост #%s без текста — пропуск", post_id)
+            return
+        word = self._is_sensitive(post_text)
+        if word and not manual:
+            log.info("Пост #%s: стоп-слово «%s» — пропуск", post_id, word)
+            return
+
+        p = Pending(key=key, chat_id=msg.chat_id, post_id=post_id, post_text=post_text)
+        if see_images and has_media:
+            p.post_images = await self._download_post_images(parts, MEDIA_DIR / str(post_id))
+            log.info("Картинок из поста для нейронки: %d", len(p.post_images))
+
+        confirm = manual or cfg.get("confirm_before_post", True)
+        if confirm:
+            p.busy = True
+            self.pending[key] = p
+            self._emit("pending", p)
+
+        try:
+            p.comment = await self._generate(post_text, p.post_images) or ""
+        except Exception as e:
+            log.error("Ошибка Claude Code: %s", e)
+            p.error = str(e)
+        p.image = self.pick_image()
+
+        if not p.comment and not p.error:
+            log.info("Пост #%s: модель решила пропустить (SKIP)", post_id)
+            if not confirm:
+                self._cleanup(p)
+                return
+            p.error = "Модель ответила SKIP (тяжёлая тема). Можно перегенерировать или пропустить."
+
+        if confirm:
+            p.busy = False
+            self._emit("pending_update", p)
+            return
+
+        if p.error:
+            self._cleanup(p)
+            return
+        delay = random.randint(cfg["delay_min_sec"], max(cfg["delay_min_sec"], cfg["delay_max_sec"]))
+        log.info("Пост #%s: жду %s сек перед публикацией", post_id, delay)
+        await asyncio.sleep(delay)
+        await self._send(p)
+        self._cleanup(p)
+
+    async def _generate(self, post_text: str, images: list[Path], wish: str = "") -> str | None:
+        async with self._gen_lock:   # по одному запросу к нейросети за раз
+            system = prompt_path(self.cfg).read_text(encoding="utf-8") + SKIP_RULE
+            user_msg = f"Текст поста:\n\n{post_text or '(текста нет, только медиа)'}"
+            if wish.strip():
+                user_msg += f"\n\nПОЖЕЛАНИЯ: {wish.strip()}"
+            gen = {"api": self._gen_api, "gemini_cli": self._gen_gemini_cli,
+                   "gemini_api": self._gen_gemini_api, "codex": self._gen_codex,
+                   "openai_api": self._gen_openai_api}.get(self.cfg.get("backend"), self._gen_claude_code)
+            text = await gen(system, user_msg, images)
+            if not text or text.upper().startswith("SKIP"):
+                return None
+            return text
+
+    async def _gen_claude_code(self, system: str, user_msg: str, images: list[Path]) -> str:
+        cfg = self.cfg
+        SYSTEM_PROMPT_FILE.write_text(system, encoding="utf-8")
+        args = [find_claude(), "-p",
+                "--system-prompt-file", str(SYSTEM_PROMPT_FILE),
+                "--model", cfg.get("model", "sonnet"),
+                "--output-format", "text"]
+        cwd = None
+        if images:
+            names = ", ".join(p.name for p in images)
+            user_msg += (f"\n\nК посту приложены картинки: {names}. Открой каждую "
+                         "инструментом Read, посмотри, что на них, и учти это в комменте. "
+                         "В ответе выведи только сам комментарий.")
+            args += ["--allowedTools", "Read", "--max-turns", str(len(images) + 2)]
+            cwd = str(images[0].parent)
+        else:
+            args += ["--max-turns", "1"]
+
+        # Чтобы Claude Code не ушёл на платный API вместо подписки
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env, cwd=cwd,
+            creationflags=NO_WINDOW,  # без чёрного окна
+        )
+        try:
+            out, err = await asyncio.wait_for(
+                proc.communicate(user_msg.encode("utf-8")),
+                timeout=cfg.get("claude_timeout_sec", 120) + 30 * len(images),
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("Claude Code не ответил вовремя")
+        if proc.returncode != 0:
+            msg = (decode_any(err) or decode_any(out)).strip()
+            raise RuntimeError(msg or f"код выхода {proc.returncode}")
+        return decode_any(out).strip()
+
+    async def _gen_gemini_cli(self, system: str, user_msg: str, images: list[Path]) -> str:
+        """Antigravity CLI: наш промпт кладём как отдельного агента в пустую рабочую папку."""
+        cfg = self.cfg
+        ws = AGY_WORKSPACE
+        shutil.rmtree(ws, ignore_errors=True)
+        agent_dir = ws / ".agents" / "agents" / AGY_AGENT
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "agent.md").write_text(
+            f"---\nname: {AGY_AGENT}\ndescription: Пишет один комментарий под пост в Telegram\n---\n"
+            + system, encoding="utf-8")
+        prompt = user_msg
+        if images:
+            for img in images:
+                shutil.copy(img, ws / img.name)
+            prompt += ("\n\nК посту приложены картинки — файлы " + ", ".join(p.name for p in images)
+                       + " в текущей папке. Посмотри их и учти в комментарии.")
+        prompt += "\n\nВыведи только сам текст комментария, без пояснений."
+
+        timeout = cfg.get("claude_timeout_sec", 120) + 30 * len(images)
+        args = [find_agy(), "--agent", AGY_AGENT, "--output-format", "json",
+                "--disable-slash-commands", "--print-timeout", f"{timeout}s"]
+        if cfg.get("gemini_model"):
+            args += ["--model", cfg["gemini_model"]]
+        args += ["-p", prompt]
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, cwd=str(ws), creationflags=NO_WINDOW)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout + 15)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("Antigravity не ответил вовремя")
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+        text_out, text_err = decode_any(out), decode_any(err)
+        if "sign in" in (text_out + text_err).lower() or "authentication required" in (text_out + text_err).lower():
+            raise RuntimeError("Не выполнен вход в Google для Antigravity — «Настройки» → «Войти в Google»")
+        try:
+            data = json.loads(text_out[text_out.index("{"):])
+        except ValueError:
+            raise RuntimeError((text_err or text_out).strip()[-500:] or f"код выхода {proc.returncode}")
+        if data.get("status") != "SUCCESS":
+            raise RuntimeError(f"Antigravity: {data.get('error') or data.get('status')}")
+        return (data.get("response") or "").strip()
+
+    async def _gen_gemini_api(self, system: str, user_msg: str, images: list[Path]) -> str:
+        from google import genai
+        from google.genai import errors as gerr, types
+        cfg = self.cfg
+        key = gemini_key(cfg)
+        if self._gemini_client is None or self._gemini_client_key != key:
+            self._gemini_client = genai.Client(api_key=key)
+            self._gemini_client_key = key
+        parts = [types.Part.from_bytes(data=img.read_bytes(),
+                                       mime_type=mimetypes.guess_type(img.name)[0] or "image/jpeg")
+                 for img in images]
+        if images:
+            user_msg += "\n\nК посту приложены картинки (выше) — учти, что на них. Выведи только сам комментарий."
+        parts.append(user_msg)
+        model = cfg.get("gemini_api_model") or GEMINI_API_DEFAULT
+        try:
+            resp = await asyncio.wait_for(
+                self._gemini_client.aio.models.generate_content(
+                    model=model, contents=parts,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system, max_output_tokens=8192,
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True))),
+                timeout=cfg.get("claude_timeout_sec", 120))
+        except asyncio.TimeoutError:
+            raise RuntimeError("Gemini API не ответил вовремя")
+        except gerr.APIError as e:
+            if e.code in (401, 403) or "API key" in str(e.message):
+                raise RuntimeError("Ключ Gemini не подходит — проверьте его в «Настройках»")
+            if e.code == 429:
+                raise RuntimeError("Исчерпан лимит запросов Gemini API — подождите или проверьте тариф")
+            if e.code == 404:
+                raise RuntimeError(f"Модель {model} не найдена — выберите другую в «Настройках»")
+            raise RuntimeError(f"Ошибка Gemini API ({e.code}): {e.message}")
+        except Exception as e:
+            raise RuntimeError(f"Нет связи с Gemini API: {e}")
+        u = resp.usage_metadata
+        if u:
+            log.info("Gemini %s: вход %s ток., выход %s ток.", model,
+                     u.prompt_token_count, (u.candidates_token_count or 0) + (u.thoughts_token_count or 0))
+        if not resp.text:
+            log.info("Gemini не вернул текст (сработал фильтр безопасности или пустой ответ)")
+            return ""
+        return resp.text.strip()
+
+    async def _gen_codex(self, system: str, user_msg: str, images: list[Path]) -> str:
+        """Codex CLI по подписке ChatGPT: наш промпт заменяет встроенные инструкции Codex."""
+        cfg = self.cfg
+        ws = CODEX_WORKSPACE
+        shutil.rmtree(ws, ignore_errors=True)
+        ws.mkdir(parents=True)
+        instr, last = ws / "instructions.md", ws / "last_message.txt"
+        instr.write_text(system, encoding="utf-8")
+        args = [find_codex(), "exec", "--skip-git-repo-check", "--ephemeral",
+                "--sandbox", "read-only", "--color", "never", "-C", str(ws),
+                "-c", f"model_instructions_file='{instr}'",
+                "-c", "project_doc_max_bytes=0",          # не читать AGENTS.md
+                "-c", "skills.include_instructions=false",
+                "-c", 'web_search="disabled"',
+                "-c", 'forced_login_method="chatgpt"',    # только подписка, не API-ключ
+                "-o", str(last)]
+        for feature in CODEX_FEATURES_OFF:
+            args += ["--disable", feature]
+        if cfg.get("codex_model"):
+            args += ["-m", cfg["codex_model"]]
+        args += [f"--image={img}" for img in images]
+        if images:
+            user_msg += "\n\nК посту приложены картинки — учти, что на них."
+        user_msg += "\n\nВыведи только сам текст комментария, без пояснений."
+        env = {k: v for k, v in os.environ.items() if k not in ("OPENAI_API_KEY", "CODEX_API_KEY")}
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, env=env, cwd=str(ws), creationflags=NO_WINDOW)
+        try:
+            out, err = await asyncio.wait_for(
+                proc.communicate(user_msg.encode("utf-8")),
+                timeout=cfg.get("claude_timeout_sec", 120) + 30 * len(images))
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("Codex не ответил вовремя")
+        try:
+            text = last.read_text(encoding="utf-8").strip() if last.exists() else ""
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+        if proc.returncode != 0 or not text:
+            msg = (decode_any(err) + decode_any(out)).strip()
+            low = msg.lower()
+            if "not logged in" in low or "401 unauthorized" in low:
+                raise RuntimeError("Не выполнен вход в ChatGPT — «Настройки» → «Войти в ChatGPT»")
+            if "usage limit" in low or "rate limit" in low:
+                raise RuntimeError("Исчерпан лимит подписки ChatGPT для Codex — подождите сброса")
+            lines = [l for l in msg.splitlines() if "error" in l.lower()]
+            raise RuntimeError("Codex: " + (lines[-1] if lines else msg[-400:] or f"код выхода {proc.returncode}"))
+        return text
+
+    async def _gen_openai_api(self, system: str, user_msg: str, images: list[Path]) -> str:
+        import openai
+        cfg = self.cfg
+        key = openai_key(cfg)
+        if self._openai_client is None or self._openai_client_key != key:
+            self._openai_client = openai.AsyncOpenAI(api_key=key)
+            self._openai_client_key = key
+        if images:
+            user_msg += "\n\nК посту приложены картинки — учти, что на них. Выведи только сам комментарий."
+        content = [{"type": "input_text", "text": user_msg}]
+        for img in images:
+            mime = mimetypes.guess_type(img.name)[0] or "image/jpeg"
+            content.append({"type": "input_image",
+                            "image_url": f"data:{mime};base64,{base64.b64encode(img.read_bytes()).decode()}"})
+        model = cfg.get("openai_api_model") or OPENAI_API_DEFAULT
+        try:
+            resp = await self._openai_client.with_options(
+                timeout=float(cfg.get("claude_timeout_sec", 120))).responses.create(
+                model=model, instructions=system, input=[{"role": "user", "content": content}])
+        except openai.AuthenticationError:
+            raise RuntimeError("Ключ OpenAI не подходит — проверьте его в «Настройках»")
+        except openai.RateLimitError as e:
+            raise RuntimeError(f"OpenAI: лимит или нет средств на балансе — {e.message}")
+        except openai.NotFoundError:
+            raise RuntimeError(f"Модель {model} недоступна — выберите другую в «Настройках»")
+        except openai.APITimeoutError:
+            raise RuntimeError("OpenAI API не ответил вовремя")
+        except openai.APIConnectionError:
+            raise RuntimeError("Нет связи с OpenAI API — проверьте интернет")
+        except openai.APIStatusError as e:
+            raise RuntimeError(f"Ошибка OpenAI API ({e.status_code}): {e.message}")
+        u = resp.usage
+        if u:
+            cached = getattr(u.input_tokens_details, "cached_tokens", 0) if u.input_tokens_details else 0
+            log.info("OpenAI %s: вход %s ток. (из кэша %s), выход %s ток.", model,
+                     u.input_tokens, cached, u.output_tokens)
+        return (resp.output_text or "").strip()
+
+    async def _gen_api(self, system: str, user_msg: str, images: list[Path]) -> str:
+        import anthropic
+        cfg = self.cfg
+        key = api_key(cfg)
+        if self._api_client is None or self._api_client_key != key:
+            self._api_client = anthropic.AsyncAnthropic(api_key=key)
+            self._api_client_key = key
+        content = []
+        for img in images:
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": mimetypes.guess_type(img.name)[0] or "image/jpeg",
+                "data": base64.standard_b64encode(img.read_bytes()).decode()}})
+        if images:
+            user_msg += "\n\nК посту приложены картинки (выше) — учти, что на них. Выведи только сам комментарий."
+        content.append({"type": "text", "text": user_msg})
+        model = cfg.get("api_model", API_MODELS[0])
+        kw = dict(
+            model=model, max_tokens=16000,
+            # Промпт большой и одинаковый — кэшируем, повторные запросы в разы дешевле
+            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": content}],
+        )
+        client = self._api_client.with_options(timeout=float(cfg.get("claude_timeout_sec", 120)))
+        try:
+            if model.startswith("claude-haiku"):
+                resp = await client.messages.create(**kw)
+            else:
+                kw["output_config"] = {"effort": "medium"}
+                try:
+                    # Если фильтр модели откажет, API сам повторит запрос на подходящей модели
+                    resp = await client.beta.messages.create(
+                        **kw, betas=["server-side-fallback-2026-07-01"], fallbacks="default")
+                except anthropic.BadRequestError as e:
+                    if "fallback" not in str(e.message).lower():
+                        raise
+                    resp = await client.messages.create(**kw)
+        except anthropic.AuthenticationError:
+            raise RuntimeError("API-ключ не подходит — проверьте его в «Настройках»")
+        except anthropic.PermissionDeniedError as e:
+            raise RuntimeError(f"Нет доступа к модели {model}: {e.message}")
+        except anthropic.RateLimitError:
+            raise RuntimeError("Слишком много запросов к API — попробуйте чуть позже")
+        except anthropic.BadRequestError as e:
+            raise RuntimeError(f"API отклонил запрос: {e.message}")
+        except anthropic.APITimeoutError:
+            raise RuntimeError("API не ответил вовремя")
+        except anthropic.APIConnectionError:
+            raise RuntimeError("Нет связи с API Anthropic — проверьте интернет")
+        except anthropic.APIStatusError as e:
+            raise RuntimeError(f"Ошибка API ({e.status_code}): {e.message}")
+
+        u = resp.usage
+        log.info("API %s: вход %s ток. (из кэша %s), выход %s ток.", resp.model,
+                 u.input_tokens + (u.cache_creation_input_tokens or 0) + (u.cache_read_input_tokens or 0),
+                 u.cache_read_input_tokens or 0, u.output_tokens)
+        if resp.stop_reason == "refusal":
+            log.info("Модель отказалась отвечать на этот пост")
+            return ""
+        return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+    async def _send(self, p: Pending) -> bool:
+        for attempt in range(2):
+            try:
+                await self.client.send_message(
+                    p.chat_id, p.comment, comment_to=p.post_id,
+                    file=str(p.image) if p.image else None,
+                )
+                log.info("✅ Комментарий опубликован под #%s (картинка: %s)",
+                         p.post_id, p.image.name if p.image else "нет")
+                self.done_posts.add(p.key)
+                with DONE_FILE.open("a") as f:
+                    f.write(p.key + "\n")
+                self._emit("posted")
+                return True
+            except errors.FloodWaitError as e:
+                if attempt == 0 and e.seconds <= 300:
+                    log.warning("Telegram просит подождать %s сек — подожду и повторю", e.seconds)
+                    await asyncio.sleep(e.seconds + 1)
+                    continue
+                p.error = f"Telegram ограничил отправку на {e.seconds} сек"
+            except errors.MsgIdInvalidError:
+                p.error = "У поста нет обсуждения (комментарии выключены)"
+            except Exception as e:
+                p.error = f"Не удалось отправить: {e}"
+            log.error("Пост #%s: %s", p.post_id, p.error)
+            return False
+        return False
+
+    def _cleanup(self, p: Pending):
+        if p.post_images:
+            shutil.rmtree(p.post_images[0].parent, ignore_errors=True)
+
+    # --- действия из окна над постом в очереди ---
+
+    def publish(self, key: str, text: str, image: Path | None):
+        async def go():
+            p = self.pending.get(key)
+            if not p or p.busy:
+                return
+            p.comment, p.image, p.busy, p.error = text.strip(), image, True, ""
+            self._emit("pending_update", p)
+            ok = await self._send(p)
+            p.busy = False
+            if ok:
+                self._finish(p, "published")
+            else:
+                self._emit("pending_update", p)
+        self._submit(go())
+
+    def regenerate(self, key: str, wish: str = ""):
+        async def go():
+            p = self.pending.get(key)
+            if not p or p.busy:
+                return
+            p.busy, p.error = True, ""
+            self._emit("pending_update", p)
+            try:
+                text = await self._generate(p.post_text, p.post_images, wish)
+                if text:
+                    p.comment = text
+                else:
+                    p.error = "Модель ответила SKIP (тяжёлая тема)"
+            except Exception as e:
+                p.error = f"Ошибка Claude Code: {e}"
+            p.busy = False
+            self._emit("pending_update", p)
+        self._submit(go())
+
+    def skip(self, key: str):
+        async def go():
+            p = self.pending.get(key)
+            if p and not p.busy:
+                log.info("Пост #%s пропущен вручную", p.post_id)
+                self._finish(p, "skipped")
+        self._submit(go())
+
+    def _finish(self, p: Pending, result: str):
+        self.pending.pop(p.key, None)
+        self._cleanup(p)
+        self._emit("pending_done", (p.key, result))
