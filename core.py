@@ -346,6 +346,29 @@ def cli_env(drop=()) -> dict:
     return env
 
 
+BACKEND_NAMES = {"claude_code": "Claude Code", "api": "Claude API", "gemini_cli": "Antigravity",
+                 "gemini_api": "Gemini API", "codex": "Codex", "openai_api": "OpenAI API"}
+
+# Так сервисы отвечают на запрос из страны, где они не работают
+REGION_MARKERS = ("not currently available in your location", "location is not supported",
+                  "unsupported_country", "unsupported country", "not available in your country",
+                  "region, or territory not supported", "request not allowed")
+
+
+def explain_ai_error(name: str, msg: str) -> str:
+    """Текст ошибки нейросети для журнала и очереди; отказ по стране — с подсказкой про VPN."""
+    msg = msg.removeprefix(f"{name}: ").strip()
+    text = msg if msg.startswith(f"Ошибка {name}") else f"Ошибка {name}: {msg}"
+    if any(m in msg.lower() for m in REGION_MARKERS):
+        sp = system_proxy()
+        route = f"через системный прокси {sp}" if sp else "без системного прокси (через VPN в режиме TUN или напрямую)"
+        text += (f"\n{name} недоступен из страны, откуда пришёл запрос. Включите VPN с сервером там, где сервис "
+                 f"работает (например, США или Европа) — в режиме TUN или «системный прокси» — и повторите. "
+                 f"Сейчас запросы идут {route}. Не помогает — попробуйте другой сервер VPN или другой "
+                 "способ подключения в «Настройках».")
+    return text
+
+
 def decode_any(data: bytes) -> str:
     """Windows-консоль может отдавать ошибки в cp866/cp1251 — пробуем все."""
     for enc in ("utf-8", "cp866", "cp1251"):
@@ -918,8 +941,8 @@ class Engine:
         try:
             p.comment = await self._generate(post_text, p.post_images) or ""
         except Exception as e:
-            self.log.error("Ошибка Claude Code: %s", e)
-            p.error = str(e)
+            p.error = self._ai_error(e)
+            self.log.error("%s", p.error)
         p.image = self.pick_image()
 
         if not p.comment and not p.error:
@@ -942,6 +965,9 @@ class Engine:
         await asyncio.sleep(delay)
         await self._send(p)
         self._cleanup(p)
+
+    def _ai_error(self, e: Exception) -> str:
+        return explain_ai_error(BACKEND_NAMES.get(self.cfg.get("backend"), "Claude Code"), str(e))
 
     async def _generate(self, post_text: str, images: list[Path], wish: str = "") -> str | None:
         async with self._gen_lock:   # по одному запросу к нейросети за раз
@@ -1298,7 +1324,8 @@ class Engine:
                 else:
                     p.error = "Модель ответила SKIP (тяжёлая тема)"
             except Exception as e:
-                p.error = f"Ошибка Claude Code: {e}"
+                p.error = self._ai_error(e)
+                self.log.error("%s", p.error)
             p.busy = False
             self._emit("pending_update", p)
         self._submit(go())

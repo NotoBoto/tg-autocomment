@@ -284,8 +284,25 @@ class CliBlock:
         log.info("%s установлен", self.name)
         self.start_login()
 
+    def vpn_ok(self) -> bool:
+        """Вход идёт из окна самой CLI — подсказку про VPN нужно дать до него, потом будет поздно."""
+        sp = core.system_proxy()
+        if sp and sp.startswith("http"):
+            return True
+        where = (f"Системный прокси {sp} — SOCKS, а {self.name} понимает только HTTP-прокси."
+                 if sp else "Системный прокси не найден.")
+        return messagebox.askokcancel(f"Вход в {self.account}", (
+            f"{where}\n\n{self.account} недоступен в некоторых странах (например, в России), и вход оттуда "
+            "без VPN не пройдёт — Google, OpenAI и Anthropic проверяют страну.\n\n"
+            "Если вы в такой стране — нажмите «Отмена», включите VPN с сервером в США или Европе "
+            "(режим TUN или системный HTTP-прокси) и повторите вход.\n\n"
+            "Если VPN в режиме TUN уже включён или ваша страна поддерживается — нажмите «ОК»."))
+
     def start_login(self):
         relogin = bool(self.state.get("loggedIn"))
+        if not self.vpn_ok():
+            self.refresh()
+            return
         try:
             self.login_fn()
         except Exception as e:
@@ -897,7 +914,8 @@ class App(ctk.CTk):
             self.progress.stop()
             self.progress.grid_forget()
         if p.busy:
-            self.err_lbl.configure(text="⏳ Claude пишет комментарий… (обычно 10–40 секунд)",
+            name = core.BACKEND_NAMES.get(self.owner(p).cfg.get("backend"), "Нейросеть")
+            self.err_lbl.configure(text=f"⏳ {name} пишет комментарий… (обычно 10–40 секунд)",
                                    text_color="gray")
         else:
             self.err_lbl.configure(text=p.error, text_color=RED)
