@@ -512,6 +512,8 @@ class App(ctk.CTk):
         self.minsize(940, 640)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        blank = Image.new("RGBA", (1, 1), (0, 0, 0, 0))   # «нет картинки» для подписей (см. show_image)
+        self.blank_img = ctk.CTkImage(light_image=blank, dark_image=blank, size=(1, 1))
         self._build_header()
         self.tabs = ctk.CTkTabview(self)
         self.tabs.pack(fill="both", expand=True, padx=12, pady=(0, 4))
@@ -1306,7 +1308,9 @@ class App(ctk.CTk):
         if img:
             self.img_preview.configure(image=img, text="")
         else:
-            self.img_preview.configure(image=None,
+            # Не image=None: у customtkinter после этого следующая картинка падает
+            # с «image "pyimageN" doesn't exist» — ставим прозрачную заглушку
+            self.img_preview.configure(image=self.blank_img,
                                        text="видео" if p.image else "без картинки")
         self.img_name.configure(text=p.image.name if p.image else "")
 
@@ -1905,16 +1909,30 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------ события
 
     def poll(self):
-        while not self.ui_q.empty():
-            self.ui_q.get_nowait()()
-        while not self.log_q.empty():
-            self.add_log(self.log_q.get_nowait())
-        for e in list(self.engines.values()):
-            while not e.events.empty():
-                kind, data = e.events.get_nowait()
-                if e.cfg["id"] in self.engines:   # профиль могли удалить
-                    self.handle(e, kind, data)
-        self.after(100, self.poll)
+        """Разбирает задания из фоновых потоков, журнал и события движков. Ошибка в одном
+        обработчике пишется в журнал и не останавливает остальные — иначе окно застынет."""
+        try:
+            while not self.ui_q.empty():
+                self.guarded(self.ui_q.get_nowait())
+            while not self.log_q.empty():
+                self.add_log(self.log_q.get_nowait())
+            for e in list(self.engines.values()):
+                while not e.events.empty():
+                    kind, data = e.events.get_nowait()
+                    if e.cfg["id"] in self.engines:   # профиль могли удалить
+                        self.guarded(lambda: self.handle(e, kind, data))
+        finally:
+            self.after(100, self.poll)
+
+    def guarded(self, fn):
+        try:
+            fn()
+        except Exception:
+            log.exception("Ошибка в окне программы")
+
+    def report_callback_exception(self, exc, val, tb):
+        """Ошибки в обработчиках кнопок tkinter — в журнал и log.txt (в .exe без консоли иначе пропадают)."""
+        log.error("Ошибка в окне программы", exc_info=(exc, val, tb))
 
     def handle(self, e: Engine, kind, data):
         own_dialog = self.login_dialog if self.login_dialog and self.login_dialog.engine is e else None

@@ -5,6 +5,7 @@ Telegram-клиент живёт в отдельном потоке со сво�
 """
 import asyncio
 import base64
+import itertools
 import json
 import logging
 import mimetypes
@@ -22,7 +23,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -773,7 +774,7 @@ def strip_reasoning(text: str) -> str:
 
 @dataclass
 class Pending:
-    key: str
+    key: str                 # уникален в очереди: «чат:пост», у повторных ручных — «чат:пост#N»
     chat_id: int
     post_id: int
     post_text: str
@@ -789,6 +790,11 @@ class Pending:
     def uid(self) -> str:
         """Ключ, уникальный среди всех профилей (один пост может ждать у нескольких аккаунтов)."""
         return f"{self.profile}|{self.key}"
+
+    @property
+    def post_key(self) -> str:
+        """Сам пост — «чат:пост»: по нему помним, под какими постами уже есть комментарий."""
+        return f"{self.chat_id}:{self.post_id}"
 
 
 # ---------- движок ----------
@@ -850,6 +856,7 @@ class Engine:
         self._qr_task: asyncio.Task | None = None
         self._dialogs_loaded = False   # список чатов подгружен (нужен, чтобы найти закрытый канал по id)
         self.inflight: set[str] = set()   # ключи постов, которые сейчас обрабатываются
+        self._manual_seq = itertools.count(2)   # номера повторных вариантов одного поста
         self._phone = ""
         self.channel_names: dict[int, str] = {}
         self.running = False
@@ -1173,13 +1180,19 @@ class Engine:
 
         post_id, post_text, parts = await self._collect_post(msg)
         key = f"{msg.chat_id}:{post_id}"
-        if key in self.pending:
-            self.log.info("Пост #%s уже в очереди", post_id)
-            return
-        if key in self.done_posts:
-            if not manual:
+        queued = any(q.post_key == key for q in self.pending.values()) or key in self.inflight
+        if not manual:
+            # Сам по себе каждый пост комментируем один раз
+            if queued or key in self.done_posts:
                 return
-            self.log.warning("Под постом #%s уже есть ваш комментарий", post_id)
+        else:
+            # Взятый вручную — всегда новый вариант, даже если комментарий уже есть или ждёт в очереди
+            if key in self.done_posts:
+                self.log.info("Под постом #%s уже есть ваш комментарий — готовлю ещё один", post_id)
+            elif queued:
+                self.log.info("Пост #%s уже в очереди — готовлю ещё один вариант", post_id)
+            if queued or key in self.pending:
+                key = f"{key}#{next(self._manual_seq)}"
         chan = self.channel_names.get(msg.chat_id, "")
         self.log.info("Новый пост %s #%s: %s", chan, post_id, post_text[:80].replace("\n", " "))
 
@@ -1210,7 +1223,9 @@ class Engine:
     async def _comment_on(self, p: Pending, parts, confirm: bool, with_images: bool):
         cfg, post_id = self.cfg, p.post_id
         if with_images:
-            p.post_images = await self._download_post_images(parts, self.media_dir / str(post_id))
+            # Своя папка у каждого варианта: картинки двух вариантов одного поста не мешают друг другу
+            folder = self.media_dir / p.key.replace(":", "_").replace("#", "_")
+            p.post_images = await self._download_post_images(parts, folder)
             self.log.info("Картинок из поста для нейронки: %d", len(p.post_images))
 
         key, post_text = p.key, p.post_text
@@ -1595,9 +1610,9 @@ class Engine:
                 )
                 self.log.info("✅ Комментарий опубликован под #%s (картинка: %s)",
                          p.post_id, p.image.name if p.image else "нет")
-                self.done_posts.add(p.key)
+                self.done_posts.add(p.post_key)
                 with self.done_file.open("a") as f:
-                    f.write(p.key + "\n")
+                    f.write(p.post_key + "\n")
                 self._emit("posted")
                 return True
             except errors.FloodWaitError as e:
