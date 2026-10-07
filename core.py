@@ -19,7 +19,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from telethon import TelegramClient, events, errors, utils
+from telethon import TelegramClient, connection, events, errors, utils
 
 BASE = Path(__file__).parent
 CONFIG_FILE = BASE / "config.json"
@@ -45,6 +45,8 @@ DEFAULTS = {
     "api_id": "",
     "api_hash": "",
     "session_name": "my_account",
+    "proxy_mode": "system",        # прокси для Telegram: system (из VPN/Windows) | custom | none
+    "proxy": "",                   # для custom: socks5://…, http://… или ссылка MTProxy
     "channels": [],                # каналы, за которыми следим
     "backend": "claude_code",      # claude_code | api (Anthropic) | gemini_cli (Antigravity) | gemini_api | codex | openai_api
     "model": "sonnet",
@@ -172,7 +174,7 @@ def claude_status() -> dict:
         return {"installed": False, "loggedIn": False}
     try:
         r = subprocess.run([exe, "auth", "status", "--json"], capture_output=True,
-                           timeout=30, creationflags=NO_WINDOW)
+                           timeout=30, env=cli_env(), creationflags=NO_WINDOW)
         info = json.loads(decode_any(r.stdout))
     except Exception:
         info = {"loggedIn": False}
@@ -209,7 +211,7 @@ def install_claude() -> tuple[bool, str]:
     r = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
          "irm https://claude.ai/install.ps1 | iex"],
-        capture_output=True, timeout=600, creationflags=NO_WINDOW)
+        capture_output=True, timeout=600, env=cli_env(), creationflags=NO_WINDOW)
     out = (decode_any(r.stdout) + "\n" + decode_any(r.stderr)).strip()
     return find_claude() is not None, out
 
@@ -217,7 +219,7 @@ def install_claude() -> tuple[bool, str]:
 def open_claude_login():
     """Открывает вход в отдельном окне консоли: там ссылка/браузер и, если нужно, поле для кода."""
     subprocess.Popen([find_claude(), "auth", "login", "--claudeai"],
-                     creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+                     env=cli_env(), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
 
 
 def validate(cfg) -> list[str]:
@@ -229,6 +231,12 @@ def validate(cfg) -> list[str]:
         problems.append("Не указан API Hash (с my.telegram.org)")
     if not channels(cfg):
         problems.append("Не указан ни один канал")
+    if cfg.get("proxy_mode") == "custom" and not str(cfg.get("proxy", "")).strip():
+        problems.append("Выбран свой прокси, но адрес не указан")
+    try:
+        telegram_proxy(cfg)
+    except ValueError as e:
+        problems.append(f"Прокси: {e}")
     p = prompt_path(cfg)
     if not p.exists() or not p.read_text(encoding="utf-8").strip():
         problems.append("Промпт пустой — заполните вкладку «Промпт»")
@@ -267,6 +275,77 @@ def validate(cfg) -> list[str]:
     return problems
 
 
+# ---------- прокси ----------
+# Где Telegram и нейросети заблокированы, нужен VPN. В режиме TUN он программе не мешает,
+# а в режиме «системный прокси» его надо передать явно: Telethon и CLI нейросетей
+# настройки прокси Windows сами не читают (Python-SDK API читают — через httpx).
+
+def system_proxy() -> str | None:
+    """Прокси из переменных окружения или настроек Windows (его выставляет VPN-клиент)."""
+    from urllib.request import getproxies
+    p = getproxies()
+    return p.get("https") or p.get("http") or p.get("socks") or p.get("all")
+
+
+def parse_proxy(s: str) -> dict:
+    """'socks5://user:pass@host:port', 'http://host:port', 'host:port' (= http)
+    или ссылка MTProxy t.me/proxy?server=…&port=…&secret=… . Ошибка — ValueError с понятным текстом."""
+    from urllib.parse import parse_qs, unquote, urlsplit
+    s = s.strip()
+    if "proxy?" in s:
+        q = {k: v[0] for k, v in parse_qs(urlsplit(s).query).items()}
+        try:
+            host, port, secret = q["server"], int(q["port"]), q["secret"]
+        except (KeyError, ValueError):
+            raise ValueError("В ссылке MTProxy нет server, port или secret")
+        try:
+            raw = bytes.fromhex(secret)
+        except ValueError:
+            raw = base64.urlsafe_b64decode(secret + "=" * (-len(secret) % 4))
+        if raw[:1] == b"\xee":
+            raise ValueError("MTProxy с секретом ee… (FakeTLS) не поддерживается — "
+                             "нужен прокси с секретом dd… или SOCKS5/HTTP")
+        return {"type": "mtproxy", "host": host, "port": port, "secret": raw.hex()}
+    u = urlsplit(s if "://" in s else "http://" + s)
+    kind = {"socks": "socks5", "socks5h": "socks5", "https": "http"}.get(u.scheme.lower(), u.scheme.lower())
+    if kind not in ("socks5", "socks4", "http"):
+        raise ValueError(f"Неизвестный тип прокси «{u.scheme}» — нужен socks5://, http:// или ссылка MTProxy")
+    try:
+        port = u.port
+    except ValueError:
+        port = None
+    if not u.hostname or not port:
+        raise ValueError("В адресе прокси нет хоста или порта (пример: socks5://127.0.0.1:10808)")
+    return {"type": kind, "host": u.hostname, "port": port,
+            "user": unquote(u.username) if u.username else None,
+            "password": unquote(u.password) if u.password else None}
+
+
+def telegram_proxy(cfg) -> dict | None:
+    """Прокси для Telegram по настройке профиля; None — подключаемся напрямую."""
+    mode = cfg.get("proxy_mode", "system")
+    if mode == "none":
+        return None
+    s = str(cfg.get("proxy", "")).strip() if mode == "custom" else system_proxy()
+    return parse_proxy(s) if s else None
+
+
+def proxy_label(p: dict | None) -> str:
+    """Адрес прокси для журнала — без логина и пароля."""
+    return f"{p['type']}://{p['host']}:{p['port']}" if p else "напрямую"
+
+
+def cli_env(drop=()) -> dict:
+    """Окружение для CLI нейросетей и установщиков: системный HTTP-прокси передаём переменными."""
+    env = {k: v for k, v in os.environ.items() if k not in drop}
+    if not any(k.upper() == "HTTPS_PROXY" for k in env):
+        p = system_proxy()
+        if p and p.startswith("http"):
+            env["HTTPS_PROXY"] = env["HTTP_PROXY"] = p
+            env.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")   # вход через браузер идёт на localhost
+    return env
+
+
 def decode_any(data: bytes) -> str:
     """Windows-консоль может отдавать ошибки в cp866/cp1251 — пробуем все."""
     for enc in ("utf-8", "cp866", "cp1251"):
@@ -298,7 +377,7 @@ def agy_status() -> dict:
         return {"installed": False, "loggedIn": False}
     try:
         r = subprocess.run([exe, "models"], capture_output=True, timeout=40,
-                           stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+                           stdin=subprocess.DEVNULL, env=cli_env(), creationflags=NO_WINDOW)
         out = decode_any(r.stdout) + decode_any(r.stderr)
     except subprocess.TimeoutExpired:
         return {"installed": True, "loggedIn": False}
@@ -314,7 +393,7 @@ def install_agy() -> tuple[bool, str]:
     r = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
          "irm https://antigravity.google/cli/install.ps1 | iex"],
-        capture_output=True, timeout=600, creationflags=NO_WINDOW)
+        capture_output=True, timeout=600, env=cli_env(), creationflags=NO_WINDOW)
     out = (decode_any(r.stdout) + "\n" + decode_any(r.stderr)).strip()
     return find_agy() is not None, out
 
@@ -322,7 +401,7 @@ def install_agy() -> tuple[bool, str]:
 def open_agy_login():
     """Первый запуск agy без аргументов открывает браузер для входа в Google-аккаунт."""
     subprocess.Popen([find_agy()], cwd=str(Path.home()),
-                     creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+                     env=cli_env(), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
 
 
 # ---------- Gemini API ----------
@@ -406,7 +485,7 @@ def codex_status() -> dict:
         return {"installed": False, "loggedIn": False}
     try:
         r = subprocess.run([exe, "login", "status"], capture_output=True, timeout=30,
-                           stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+                           stdin=subprocess.DEVNULL, env=cli_env(), creationflags=NO_WINDOW)
         out = (decode_any(r.stdout) + decode_any(r.stderr)).lower()
     except Exception:
         return {"installed": True, "loggedIn": False}
@@ -416,7 +495,7 @@ def codex_status() -> dict:
           "authMethod": "chatgpt" if "chatgpt" in out else "api", **_codex_account()}
     try:   # модели, доступные этому аккаунту
         r = subprocess.run([exe, "debug", "models"], capture_output=True, timeout=30,
-                           stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+                           stdin=subprocess.DEVNULL, env=cli_env(), creationflags=NO_WINDOW)
         data = json.loads(decode_any(r.stdout))
         st["models"] = [m["slug"] for m in data.get("models", data)
                         if m.get("visibility") == "list" and "image" in (m.get("input_modalities") or [])]
@@ -431,13 +510,13 @@ def install_codex() -> tuple[bool, str]:
     if not find_node():
         r = subprocess.run(["winget", "install", "-e", "--id", "OpenJS.NodeJS.LTS", "--silent",
                             "--accept-package-agreements", "--accept-source-agreements"],
-                           capture_output=True, timeout=900, creationflags=NO_WINDOW)
+                           capture_output=True, timeout=900, env=cli_env(), creationflags=NO_WINDOW)
         out += decode_any(r.stdout) + decode_any(r.stderr)
         if not find_node():
             return False, out + "\nНе удалось установить Node.js"
     npm = Path(find_node()).parent / "npm.cmd"
     r = subprocess.run([str(npm), "install", "-g", "@openai/codex"], capture_output=True,
-                       timeout=900, creationflags=NO_WINDOW)
+                       timeout=900, env=cli_env(), creationflags=NO_WINDOW)
     out += decode_any(r.stdout) + decode_any(r.stderr)
     return find_codex() is not None, out.strip()
 
@@ -446,9 +525,9 @@ def open_codex_login():
     """Вход через аккаунт ChatGPT. Если уже вошли — сначала выходим, чтобы сменить аккаунт."""
     exe = find_codex()
     if codex_status().get("loggedIn"):
-        subprocess.run([exe, "logout"], capture_output=True, timeout=30, creationflags=NO_WINDOW)
+        subprocess.run([exe, "logout"], capture_output=True, timeout=30, env=cli_env(), creationflags=NO_WINDOW)
     subprocess.Popen([exe, "login"], cwd=str(Path.home()),
-                     creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+                     env=cli_env(), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
 
 
 def openai_key(cfg) -> str | None:
@@ -595,14 +674,34 @@ class Engine:
         cfg = self.cfg
         self._emit("status", "connecting")
         self._gen_lock = asyncio.Lock()
+        try:
+            proxy = telegram_proxy(cfg)
+        except ValueError as e:
+            self._emit("status", "stopped")
+            self.log.error("Прокси: %s", e)
+            return
+        kw = {}
+        if proxy and proxy["type"] == "mtproxy":
+            kw = {"connection": connection.ConnectionTcpMTProxyRandomizedIntermediate,
+                  "proxy": (proxy["host"], proxy["port"], proxy["secret"])}
+        elif proxy:
+            kw = {"proxy": {"proxy_type": proxy["type"], "addr": proxy["host"], "port": proxy["port"],
+                            "username": proxy["user"], "password": proxy["password"], "rdns": True}}
+        if proxy:
+            self.log.info("Подключаюсь к Telegram через прокси %s", proxy_label(proxy))
         self.client = TelegramClient(str(BASE / cfg["session_name"]),
-                                     int(cfg["api_id"]), str(cfg["api_hash"]).strip())
+                                     int(cfg["api_id"]), str(cfg["api_hash"]).strip(), **kw)
         try:
             await self.client.connect()
         except Exception as e:
             self.client = None
             self._emit("status", "stopped")
-            self.log.error("Не удалось подключиться к Telegram: %s", e)
+            if proxy:
+                self.log.error("Не удалось подключиться к Telegram через прокси %s: %s — проверьте, "
+                               "что VPN включён и адрес прокси верный", proxy_label(proxy), e)
+            else:
+                self.log.error("Не удалось подключиться к Telegram: %s — если Telegram у вас "
+                               "заблокирован, включите VPN (см. «Прокси» в «Настройках»)", e)
             return
         if await self.client.is_user_authorized():
             await self._after_login()
@@ -877,8 +976,7 @@ class Engine:
             args += ["--max-turns", "1"]
 
         # Чтобы Claude Code не ушёл на платный API вместо подписки
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+        env = cli_env(drop=("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"))
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdin=asyncio.subprocess.PIPE,
@@ -926,7 +1024,7 @@ class Engine:
         args += ["-p", prompt]
         proc = await asyncio.create_subprocess_exec(
             *args, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, cwd=str(ws), creationflags=NO_WINDOW)
+            stderr=asyncio.subprocess.PIPE, env=cli_env(), cwd=str(ws), creationflags=NO_WINDOW)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout + 15)
         except asyncio.TimeoutError:
@@ -1013,7 +1111,7 @@ class Engine:
         if images:
             user_msg += "\n\nК посту приложены картинки — учти, что на них."
         user_msg += "\n\nВыведи только сам текст комментария, без пояснений."
-        env = {k: v for k, v in os.environ.items() if k not in ("OPENAI_API_KEY", "CODEX_API_KEY")}
+        env = cli_env(drop=("OPENAI_API_KEY", "CODEX_API_KEY"))
         proc = await asyncio.create_subprocess_exec(
             *args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, env=env, cwd=str(ws), creationflags=NO_WINDOW)

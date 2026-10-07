@@ -32,6 +32,7 @@ BACKENDS = {"Claude Code": "claude_code", "Claude API": "api",
             "Antigravity (Google)": "gemini_cli", "Gemini API": "gemini_api",
             "ChatGPT (Codex)": "codex", "OpenAI API": "openai_api"}
 DEFAULT_MODEL = "(по умолчанию)"
+PROXY_MODES = {"Системный (из VPN)": "system", "Свой": "custom", "Без прокси": "none"}
 MODE_CONFIRM, MODE_AUTO = "Подтверждать вручную", "Публиковать сами"
 
 log = logging.getLogger("autocomment")
@@ -1011,6 +1012,15 @@ class App(ctk.CTk):
         ctk.CTkLabel(tg, text="по одному на строку:\nusername, @username\nили ссылка t.me/…",
                      text_color="gray", justify="left").grid(row=5, column=2, sticky="nw", padx=10, pady=5)
         field(tg, 6, "session_name", "Имя файла сессии", "менять не нужно", width=200)
+        ctk.CTkLabel(tg, text="Прокси").grid(row=7, column=0, sticky="w", padx=14, pady=5)
+        self.proxy_mode = ctk.CTkSegmentedButton(tg, values=list(PROXY_MODES),
+                                                 command=lambda v: self.show_proxy())
+        self.proxy_mode.grid(row=7, column=1, sticky="w", padx=4)
+        self.proxy_entry = ctk.CTkEntry(tg, placeholder_text="socks5://127.0.0.1:10808, http://… "
+                                                             "или ссылка t.me/proxy?…")
+        self.fields["proxy"] = self.proxy_entry
+        self.proxy_hint = ctk.CTkLabel(tg, text="", text_color="gray", justify="left", wraplength=640)
+        self.proxy_hint.grid(row=9, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 10))
 
         ai = section("Нейросеть")
         ai.grid_columnconfigure(0, minsize=LABEL_W)
@@ -1179,6 +1189,28 @@ class App(ctk.CTk):
 
     # --- выбор способа подключения к нейросети ---
 
+    def show_proxy(self):
+        mode = PROXY_MODES.get(self.proxy_mode.get(), "system")
+        if mode == "custom":
+            self.proxy_entry.grid(row=8, column=1, sticky="ew", padx=4, pady=5)
+            hint = ("Только для Telegram этого аккаунта: SOCKS5, HTTP или MTProxy (секрет dd…; "
+                    "ee… не поддерживается). Нейросети ходят через системный прокси или VPN.")
+        else:
+            self.proxy_entry.grid_forget()
+            sp = core.system_proxy()
+            if mode == "none":
+                hint = "Подключение напрямую. Подходит, если Telegram не заблокирован или VPN в режиме TUN."
+            elif sp and sp.startswith("http"):
+                hint = f"Найден системный прокси {sp} — через него пойдут Telegram и нейросети."
+            elif sp:
+                hint = (f"Найден системный прокси {sp} — через него пойдут Telegram и нейросети по API-ключу. "
+                        "Claude Code, Codex и Antigravity понимают только HTTP-прокси — для них нужен VPN в режиме TUN.")
+            else:
+                hint = ("Системный прокси сейчас не включён — подключение напрямую. Если Telegram заблокирован: "
+                        "включите VPN в режиме TUN или в режиме «системный прокси» (Proxy) "
+                        "и перезапустите аккаунт.")
+        self.proxy_hint.configure(text=hint)
+
     def show_backend(self):
         current = BACKENDS.get(self.backend.get(), "claude_code")
         for key, f in self.backend_frames.items():
@@ -1199,6 +1231,8 @@ class App(ctk.CTk):
             e.insert(0, str(c.get(key, "")))
         self.channels_box.delete("1.0", "end")
         self.channels_box.insert("1.0", "\n".join(core.channels(c)))
+        self.proxy_mode.set(next(k for k, v in PROXY_MODES.items() if v == c.get("proxy_mode", "system")))
+        self.show_proxy()
         self.model.set(c["model"])
         self.api_model.set(c.get("api_model") or core.API_MODELS[0])
         self.gemini_model.set(c.get("gemini_model") or DEFAULT_MODEL)
@@ -1251,6 +1285,8 @@ class App(ctk.CTk):
         new["api_hash"] = f["api_hash"]
         new["channels"] = core.channels({"channels": self.channels_box.get("1.0", "end").splitlines()})
         new["session_name"] = f["session_name"] or "my_account"
+        new["proxy_mode"] = PROXY_MODES.get(self.proxy_mode.get(), "system")
+        new["proxy"] = f["proxy"]
         twin = next((p for p in self.conf["profiles"]
                      if p is not self.cfg and p["session_name"] == new["session_name"]), None)
         if twin:
@@ -1273,7 +1309,7 @@ class App(ctk.CTk):
         new["attach_image_chance"] = round(self.chance.get() / 100, 2)
         new["skip_keywords"] = [w.strip() for w in self.keywords.get("1.0", "end").splitlines() if w.strip()]
 
-        restart_keys = ("api_id", "api_hash", "channels", "session_name")
+        restart_keys = ("api_id", "api_hash", "channels", "session_name", "proxy_mode", "proxy")
         needs_restart = self.engine.status != "stopped" and any(new[k] != self.cfg[k] for k in restart_keys)
         if new["images_dir"] != self.cfg["images_dir"]:
             self.engine.reset_deck()
