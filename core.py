@@ -144,12 +144,56 @@ def save_config(cfg: dict):
 
 
 def normalize_channel(s: str) -> str:
-    """'@name', 't.me/name', 'https://t.me/name/123' -> 'name'."""
+    """Канал из списка в одном виде:
+    публичный — 'name' (из '@name', 't.me/name', 't.me/name/123');
+    закрытый — 't.me/c/<id>' (из ссылки на его пост или id -100…) или 't.me/+<hash>' (ссылка-приглашение)."""
     s = s.strip()
-    m = re.search(r"t\.me/(?:s/)?([A-Za-z0-9_]+)", s)
+    m = re.search(r"(?:t\.me|telegram\.me)/(?:joinchat/|\+)([A-Za-z0-9_-]+)", s)
+    if m:
+        return f"t.me/+{m.group(1)}"
+    m = re.search(r"(?:t\.me|telegram\.me)/(?:s/)?c/(\d+)", s)
+    if m:
+        return f"t.me/c/{m.group(1)}"
+    m = re.fullmatch(r"-100(\d+)", s)
+    if m:
+        return f"t.me/c/{m.group(1)}"
+    m = re.search(r"(?:t\.me|telegram\.me)/(?:s/)?([A-Za-z0-9_]+)", s)
     if m:
         return m.group(1)
     return s.lstrip("@")
+
+
+def channel_label(c: str) -> str:
+    """Как показать канал из списка: '@name' у публичного, ссылка — у закрытого."""
+    return c if c.startswith("t.me/") else "@" + c
+
+
+def parse_post_link(s: str) -> tuple[str | int, int]:
+    """Ссылка на пост → (канал, номер поста). Канал — username или id закрытого канала (-100…).
+    Понимает t.me/канал/123, t.me/s/канал/123, t.me/c/<id>/123, посты в темах, tg://resolve и tg://privatepost."""
+    from urllib.parse import parse_qs, urlsplit
+    s = s.strip()
+    if s.startswith("tg://"):
+        u = urlsplit(s)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        if u.netloc == "resolve" and q.get("domain") and q.get("post", "").isdigit():
+            return q["domain"], int(q["post"])
+        if u.netloc == "privatepost" and q.get("channel", "").isdigit() and q.get("post", "").isdigit():
+            return int("-100" + q["channel"]), int(q["post"])
+        raise ValueError("В ссылке tg:// нет канала или номера поста")
+    m = re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/(\S+)", s)
+    if not m:
+        raise ValueError("Это не ссылка на пост Telegram — нужна вида t.me/канал/123")
+    path = [p for p in urlsplit("https://x/" + m.group(1)).path.split("/") if p]
+    if path and path[0] == "s":
+        path = path[1:]
+    # Последнее число — сам пост; между ними может быть номер темы (t.me/канал/тема/пост)
+    if len(path) >= 3 and path[0] == "c" and path[1].isdigit() and path[-1].isdigit():
+        return int("-100" + path[1]), int(path[-1])
+    if len(path) >= 2 and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", path[0]) and path[-1].isdigit():
+        return path[0], int(path[-1])
+    raise ValueError("В ссылке нет номера поста — нужна ссылка на конкретный пост: t.me/канал/123 "
+                     "(в Telegram: правой кнопкой по посту → «Копировать ссылку»)")
 
 
 def prompt_path(cfg) -> Path:
@@ -789,6 +833,7 @@ class Engine:
         self._openai_client = None
         self._openai_client_key = None
         self._qr_task: asyncio.Task | None = None
+        self._dialogs_loaded = False   # список чатов подгружен (нужен, чтобы найти закрытый канал по id)
         self._phone = ""
         self.channel_names: dict[int, str] = {}
         self.running = False
@@ -827,6 +872,7 @@ class Engine:
         cfg = self.cfg
         self._emit("status", "connecting")
         self._gen_lock = asyncio.Lock()
+        self._dialogs_loaded = False   # новое подключение — список чатов загрузим заново при надобности
         try:
             proxy = telegram_proxy(cfg)
         except ValueError as e:
@@ -935,6 +981,39 @@ class Engine:
     def cancel_login(self):
         self.stop()
 
+    async def _resolve_channel(self, name: str):
+        """Канал по записи из списка (см. normalize_channel). ValueError — с понятной причиной."""
+        from telethon.tl import functions, types
+        if name.startswith("t.me/+"):   # ссылка-приглашение в закрытый канал
+            try:
+                inv = await self.client(functions.messages.CheckChatInviteRequest(name[len("t.me/+"):]))
+            except (errors.InviteHashExpiredError, errors.InviteHashInvalidError):
+                raise ValueError("ссылка-приглашение недействительна или устарела")
+            if isinstance(inv, types.ChatInviteAlready):
+                return inv.chat
+            # Вступать сами не будем — это действие от имени аккаунта
+            raise ValueError("аккаунт не состоит в этом канале — вступите в него по ссылке в Telegram "
+                             "и перезапустите аккаунт")
+        if name.startswith("t.me/c/"):   # закрытый канал по id
+            peer = int("-100" + name[len("t.me/c/"):])
+            try:
+                return await self.client.get_entity(peer)
+            except ValueError:
+                pass
+            # Telegram отдаёт закрытый канал по id, только если он есть в списке чатов аккаунта
+            if not self._dialogs_loaded:
+                await self.client.get_dialogs()
+                self._dialogs_loaded = True
+            try:
+                return await self.client.get_entity(peer)
+            except ValueError:
+                raise ValueError("аккаунт не состоит в этом закрытом канале")
+        return await self.client.get_entity(name)
+
+    @staticmethod
+    def _channel_title(ent) -> str:
+        return "@" + ent.username if getattr(ent, "username", None) else getattr(ent, "title", "канал")
+
     async def _after_login(self):
         cfg = self.cfg
         me = await self.client.get_me()
@@ -942,12 +1021,12 @@ class Engine:
         self.channel_names = {}
         for name in channels(cfg):
             try:
-                ent = await self.client.get_entity(name)
+                ent = await self._resolve_channel(name)
             except Exception as e:
-                self.log.error("Канал @%s не найден — пропускаю: %s", name, e)
+                self.log.error("Канал %s не найден — пропускаю: %s", channel_label(name), e)
                 continue
             entities.append(ent)
-            self.channel_names[utils.get_peer_id(ent)] = "@" + (getattr(ent, "username", None) or name)
+            self.channel_names[utils.get_peer_id(ent)] = self._channel_title(ent)
         if not entities:
             self.log.error("Ни один канал не найден — проверьте список в «Настройках»")
             await self._stop()
@@ -1020,11 +1099,45 @@ class Engine:
         """Взять последний пост канала — удобно, чтобы проверить промпт."""
         async def go():
             name = normalize_channel(channel or "") or channels(self.cfg)[0]
-            msgs = await self.client.get_messages(name, limit=1)
-            if not msgs:
-                self.log.warning("В канале @%s нет постов", name)
+            try:
+                ent = await self._resolve_channel(name)
+            except (ValueError, errors.RPCError) as e:
+                self.log.warning("Канал %s не найден: %s", channel_label(name), e)
                 return
+            msgs = await self.client.get_messages(ent, limit=1)
+            if not msgs:
+                self.log.warning("В канале %s нет постов", channel_label(name))
+                return
+            self.channel_names.setdefault(utils.get_peer_id(ent), self._channel_title(ent))
             await self._handle_post(msgs[0], manual=True)
+        self._submit(go())
+
+    def take_post_by_link(self, link: str):
+        """Взять конкретный пост по ссылке — канал может и не быть в списке."""
+        async def go():
+            try:
+                peer, post_id = parse_post_link(link)
+            except ValueError as e:
+                self.log.warning("Ссылка на пост: %s", e)
+                return
+            key = f"t.me/c/{str(peer)[4:]}" if isinstance(peer, int) else peer   # -100<id> → t.me/c/<id>
+            try:
+                ent = await self._resolve_channel(key)
+            except (ValueError, errors.RPCError) as e:
+                self.log.warning("Канал %s не найден: %s", channel_label(key), e)
+                return
+            msg = await self.client.get_messages(ent, ids=post_id)
+            name = self._channel_title(ent)
+            if not msg:
+                self.log.warning("Пост #%s в %s не найден — удалён или ссылка неверная", post_id, name)
+                return
+            # У альбома сведения о комментариях есть не у каждой части — его не проверяем
+            if not msg.grouped_id and not (msg.replies and msg.replies.comments):
+                self.log.warning("Под постом #%s в %s нельзя комментировать — у канала выключены комментарии",
+                                 post_id, name)
+                return
+            self.channel_names[utils.get_peer_id(ent)] = name
+            await self._handle_post(msg, manual=True)
         self._submit(go())
 
     async def _handle_post(self, msg, manual: bool):

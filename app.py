@@ -941,7 +941,7 @@ class App(ctk.CTk):
             text = f"Работает · аккаунтов: {len(running)} из {len(engines)}"
         elif st == "running" and running[0].me_name:
             chans = core.channels(self.cfg)
-            where = f"@{chans[0]}" if len(chans) == 1 else f"каналов: {len(chans)}"
+            where = core.channel_label(chans[0]) if len(chans) == 1 else f"каналов: {len(chans)}"
             text = f"Работает · {running[0].me_name} · {where}"
         self.status_dot.configure(text_color=color)
         self.status_lbl.configure(text=text)
@@ -1019,7 +1019,7 @@ class App(ctk.CTk):
         self.engine.take_latest_post(self.latest_chan.get() if len(chans) > 1 else None)
 
     def update_channel_menu(self):
-        chans = ["@" + c for c in core.channels(self.cfg)]
+        chans = [core.channel_label(c) for c in core.channels(self.cfg)]
         if len(chans) > 1:
             self.latest_chan.configure(values=chans)
             if self.latest_chan.get() not in chans:
@@ -1032,11 +1032,43 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------------ очередь
 
+    def take_by_link(self):
+        link = self.link_entry.get().strip()
+        if not link:
+            return
+        try:
+            core.parse_post_link(link)
+        except ValueError as e:
+            self.link_msg.configure(text=str(e), text_color=RED)
+            return
+        if self.engine.status != "running":
+            self.link_msg.configure(text=f"Сначала запустите аккаунт «{self.cfg['name']}»", text_color=RED)
+            return
+        self.link_msg.configure(text="Беру пост… (если что-то не так — причина появится внизу окна)",
+                                text_color="gray")
+        self.after(8000, lambda: self.link_msg.configure(text=""))
+        self.link_entry.delete(0, "end")
+        self.engine.take_post_by_link(link)
+
     def _build_queue_tab(self, tab):
         tab.grid_columnconfigure(1, weight=1)
-        tab.grid_rowconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        # Взять конкретный пост по ссылке — канал может и не быть в списке
+        lb = ctk.CTkFrame(tab, fg_color="transparent")
+        lb.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        lb.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(lb, text="Пост по ссылке:").grid(row=0, column=0, padx=(0, 8))
+        self.link_entry = ctk.CTkEntry(lb, placeholder_text="t.me/канал/123 — любой канал, не обязательно из списка; "
+                                                            "закрытый — t.me/c/…, если аккаунт в нём состоит")
+        self.link_entry.grid(row=0, column=1, sticky="ew")
+        self.link_entry.bind("<Return>", lambda e: self.take_by_link())
+        ctk.CTkButton(lb, text="Взять", width=90, command=self.take_by_link).grid(row=0, column=2, padx=(8, 0))
+        self.link_msg = ctk.CTkLabel(lb, text="", text_color="gray", anchor="w")
+        self.link_msg.grid(row=1, column=1, columnspan=2, sticky="w")
+
         self.list_frame = ctk.CTkScrollableFrame(tab, width=260, label_text="Ждут решения")
-        self.list_frame.grid(row=0, column=0, sticky="ns", padx=(0, 10))
+        self.list_frame.grid(row=1, column=0, sticky="ns", padx=(0, 10))
 
         self.empty = ctk.CTkLabel(tab, text="", font=ctk.CTkFont(size=15),
                                   text_color="gray", justify="center")
@@ -1157,15 +1189,16 @@ class App(ctk.CTk):
             elif self.cfg["confirm_before_post"]:
                 msg = ("Новых постов пока нет.\n\nКогда в канале выйдет пост, здесь появится "
                        "готовый комментарий —\nего можно поправить, перегенерировать или опубликовать.\n\n"
-                       "Хотите проверить промпт? Нажмите «Взять последний пост канала».")
+                       "Хотите проверить промпт? Нажмите «Взять последний пост канала»\n"
+                       "или вставьте ссылку на любой пост в поле сверху.")
             else:
                 msg = ("Автоматический режим: комментарии публикуются сами.\n"
                        "Что происходит — во вкладке «Журнал».")
             self.empty.configure(text=msg)
-            self.empty.grid(row=0, column=1, sticky="nsew")
+            self.empty.grid(row=1, column=1, sticky="nsew")
             return
         self.empty.grid_forget()
-        self.detail.grid(row=0, column=1, sticky="nsew")
+        self.detail.grid(row=1, column=1, sticky="nsew")
         self.show_detail(p)
 
     def show_detail(self, p: Pending):
@@ -1305,9 +1338,10 @@ class App(ctk.CTk):
                       command=lambda: webbrowser.open("https://my.telegram.org/apps")
                       ).grid(row=4, column=1, sticky="w")
         ctk.CTkLabel(tg, text="Каналы").grid(row=5, column=0, sticky="nw", padx=14, pady=8)
-        self.channels_box = ctk.CTkTextbox(tg, height=86)
+        self.channels_box = ctk.CTkTextbox(tg, height=116)
         self.channels_box.grid(row=5, column=1, sticky="ew", padx=4, pady=5)
-        ctk.CTkLabel(tg, text="по одному на строку:\nusername, @username\nили ссылка t.me/…",
+        ctk.CTkLabel(tg, text="по одному на строку:\nusername, @username\nили ссылка t.me/…\n"
+                              "закрытый — приглашение\nt.me/+… или ссылка на\nего пост t.me/c/…",
                      text_color="gray", justify="left").grid(row=5, column=2, sticky="nw", padx=10, pady=5)
         field(tg, 6, "session_name", "Имя файла сессии", "менять не нужно", width=200)
         ctk.CTkLabel(tg, text="Прокси").grid(row=7, column=0, sticky="w", padx=14, pady=5)
