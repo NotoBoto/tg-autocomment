@@ -18,6 +18,7 @@ import qrcode
 from PIL import Image
 
 import core
+import updater
 from core import BASE, Engine, Pending
 
 GREEN, GREEN_HOVER = "#2e9e5b", "#257f49"
@@ -111,14 +112,18 @@ def single_instance() -> socket.socket | None | bool:
 #  Значок в трее
 # ======================================================================
 
-def tray_image(color: str) -> Image.Image:
+APP_COLOR = "#2b7bd0"   # цвет значка программы (assets/icon.ico рисуется из tray_image)
+
+
+def tray_image(color: str, size: int = 64) -> Image.Image:
     """Облачко комментария на круге цвета статуса."""
     from PIL import ImageDraw
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    k = size / 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.ellipse((0, 0, 63, 63), fill=color)
-    d.rounded_rectangle((14, 17, 50, 41), radius=7, fill="white")
-    d.polygon([(20, 40), (20, 50), (30, 40)], fill="white")
+    d.ellipse((0, 0, size - 1, size - 1), fill=color)
+    d.rounded_rectangle((14 * k, 17 * k, 50 * k, 41 * k), radius=7 * k, fill="white")
+    d.polygon([(20 * k, 40 * k), (20 * k, 50 * k), (30 * k, 40 * k)], fill="white")
     return img
 
 
@@ -474,10 +479,16 @@ class KeyBlock:
 # ======================================================================
 
 class App(ctk.CTk):
-    def __init__(self, autostart=False, instance: socket.socket | None = None):
+    def __init__(self, hidden=False, run_delay: int | None = None, updated=False,
+                 instance: socket.socket | None = None):
+        """hidden — сразу в трей; run_delay — через сколько секунд самим начать работу
+        (автозапуск с Windows, продолжение после обновления); updated — запуск после обновления."""
         super().__init__()
-        if autostart:
+        if hidden:
             self.withdraw()   # до первой отрисовки — окно не мелькнёт
+        icon = core.RES / "assets" / "icon.ico"
+        if icon.exists():
+            self.iconbitmap(str(icon))
         self.log_q = setup_logging()
         first_run = not core.CONFIG_FILE.exists()
         # Не self.config: это имя метода tkinter
@@ -490,6 +501,7 @@ class App(ctk.CTk):
         self.selected: str | None = None     # Pending.uid
         self.shown_comment: dict[str, str] = {}
         self.posted_count = 0
+        self.status = "stopped"   # общий статус; нужен сразу — меню трея читает его из своего потока
 
         self.title("TG Автокомментатор")
         self.geometry("1120x760")
@@ -526,12 +538,123 @@ class App(ctk.CTk):
                 core.set_autostart(True)
             except OSError as e:
                 log.warning("Не удалось обновить автозапуск: %s", e)
-        if autostart:
-            if not self.tray:
-                self.deiconify()
-            log.info("Запуск вместе с Windows: начну работу через %d сек", core.AUTO_RUN_DELAY)
-            self.after(core.AUTO_RUN_DELAY * 1000, self.auto_run)
+        if hidden and not self.tray:
+            self.deiconify()
+        if updated:
+            log.info("Программа обновлена до версии %s", core.VERSION)
+            if self.tray:
+                self.tray.notify(f"Программа обновлена до версии {core.VERSION}")
+        if run_delay is not None:
+            log.info("Начну работу через %d сек", run_delay)
+            self.after(run_delay * 1000, self.auto_run)
+        self.update_info: updater.Update | None = None
+        self.updating = False
+        self.after(15_000, self.check_updates)
         self.after(100, self.poll)
+
+    # ------------------------------------------------------------------ обновления
+
+    UPDATE_EVERY_MS = 6 * 3600 * 1000
+
+    def check_updates(self, manual=False):
+        """Фоновая проверка GitHub Releases: при запуске и раз в 6 часов; manual — по кнопке."""
+        if not manual:
+            self.after(self.UPDATE_EVERY_MS, self.check_updates)
+        if self.updating:
+            return
+        if manual:
+            self.update_check_lbl.configure(text="Проверяю…", text_color="gray")
+
+        def work():
+            try:
+                return updater.check(), None
+            except Exception as e:
+                return None, e
+
+        def done(res):
+            u, err = res
+            if err:
+                log.warning("Не удалось проверить обновления: %s", err)
+                if manual:
+                    self.update_check_lbl.configure(text="Не удалось проверить — нет связи с GitHub", text_color=RED)
+                return
+            if not u:
+                if manual:
+                    self.update_check_lbl.configure(text="У вас последняя версия ✓", text_color=GREEN)
+                return
+            if manual:
+                self.update_check_lbl.configure(text=f"Доступна версия {u.version}", text_color=GREEN)
+            fresh = not self.update_info or self.update_info.version != u.version
+            self.update_info = u
+            if fresh:
+                log.info("Доступна новая версия %s", u.version)
+            if core.FROZEN and u.url and self.conf["auto_update"] and not manual and self.can_update_quietly():
+                self.start_update()
+                return
+            self.show_update_bar()
+            if fresh and self.tray and self.state() == "withdrawn":
+                self.tray.notify(f"Доступна версия {u.version} — откройте окно, чтобы обновить")
+        self.in_thread(work, done)
+
+    def can_update_quietly(self) -> bool:
+        """Сами ставим обновление, только если ничего не прервём: очередь пуста, промпт сохранён, нет входа."""
+        return not self.all_pending() and not self.prompt_dirty() and not self.login_dialog
+
+    def show_update_bar(self):
+        u = self.update_info
+        can_install = core.FROZEN and u.url
+        self.update_lbl.configure(text=f"Доступна новая версия {u.version} (у вас {core.VERSION})")
+        self.update_btn.configure(text="Обновить сейчас" if can_install else "Скачать",
+                                  state="normal", command=self.start_update if can_install
+                                  else lambda: webbrowser.open(u.page))
+        self.update_bar.pack(fill="x", padx=12, pady=(0, 4), after=self.header_top)
+
+    def start_update(self):
+        u = self.update_info
+        if not u or self.updating:
+            return
+        self.updating = True
+        self.show_update_bar()
+        self.update_btn.configure(state="disabled")
+        self.update_lbl.configure(text=f"Скачиваю версию {u.version}…")
+        log.info("Скачиваю обновление %s…", u.version)
+
+        def progress(x):
+            self.after(0, lambda: self.update_lbl.configure(text=f"Скачиваю версию {u.version}… {int(x * 100)}%"))
+
+        def work():
+            try:
+                return updater.download(u, progress), None
+            except Exception as e:
+                return None, e
+
+        def done(res):
+            setup, err = res
+            if err:
+                self.updating = False
+                log.error("Не удалось скачать обновление: %s", err)
+                self.update_lbl.configure(text=f"Не удалось скачать обновление: {err}")
+                self.update_btn.configure(state="normal", text="Повторить")
+                return
+            run = any(e.status != "stopped" for e in self.engines.values())
+            tray = self.state() == "withdrawn"
+            log.info("Устанавливаю версию %s — программа перезапустится", u.version)
+            self.shutdown()
+            updater.install(setup, run=run, tray=tray)
+            self.destroy()
+        self.in_thread(work, done)
+
+    def shutdown(self):
+        """Останавливает все аккаунты и убирает значок — перед выходом и перед обновлением."""
+        stops = [e._submit(e._stop()) for e in self.engines.values()]
+        for fut in stops:
+            try:
+                fut.result(timeout=5)
+            except Exception:
+                pass
+        shutil.rmtree(core.MEDIA_DIR, ignore_errors=True)
+        if self.tray:
+            self.tray.stop()
 
     def listen_instances(self, srv: socket.socket):
         """Повторный запуск программы: показываем это окно вместо второй копии."""
@@ -755,8 +878,22 @@ class App(ctk.CTk):
     def _build_header(self):
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=16, pady=(12, 4))
+        self.header_top = top
         ctk.CTkLabel(top, text="TG Автокомментатор",
                      font=ctk.CTkFont(size=20, weight="bold")).pack(side="left")
+        ctk.CTkLabel(top, text=f"v{core.VERSION}", text_color="gray").pack(side="left", padx=(6, 0), pady=(6, 0))
+
+        # Полоса «доступна новая версия» — показывается под заголовком, когда есть обновление
+        self.update_bar = ctk.CTkFrame(self, fg_color=("#e3f0ff", "#1d2f44"))
+        self.update_lbl = ctk.CTkLabel(self.update_bar, text="")
+        self.update_lbl.pack(side="left", padx=12, pady=6)
+        ctk.CTkButton(self.update_bar, text="Позже", width=80, fg_color=GRAY, hover_color=GRAY_HOVER,
+                      command=self.update_bar.pack_forget).pack(side="right", padx=(4, 10))
+        ctk.CTkButton(self.update_bar, text="Что нового", width=110, fg_color=GRAY, hover_color=GRAY_HOVER,
+                      command=lambda: webbrowser.open(self.update_info.page)).pack(side="right", padx=4)
+        self.update_btn = ctk.CTkButton(self.update_bar, text="Обновить сейчас", width=150, fg_color=GREEN,
+                                        hover_color=GREEN_HOVER)
+        self.update_btn.pack(side="right", padx=4)
         self.status_dot = ctk.CTkLabel(top, text="●", font=ctk.CTkFont(size=18))
         self.status_dot.pack(side="left", padx=(18, 4))
         self.status_lbl = ctk.CTkLabel(top, text="")
@@ -1317,7 +1454,7 @@ class App(ctk.CTk):
         self.keywords = ctk.CTkTextbox(fl, height=150)
         self.keywords.grid(row=2, column=0, columnspan=3, sticky="ew", padx=14, pady=(6, 12))
 
-        wn = section("Окно", "Общее для всех аккаунтов")
+        wn = section("Программа", "Общее для всех аккаунтов")
         self.tray_sw = ctk.CTkSwitch(wn, text="При закрытии окна сворачивать в трей — программа продолжает "
                                               "работать, выход через значок в трее",
                                      command=self.on_tray_switch)
@@ -1330,7 +1467,23 @@ class App(ctk.CTk):
                                           command=self.on_autostart_switch)
         if core.get_autostart():
             self.autostart_sw.select()
-        self.autostart_sw.grid(row=3, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 12))
+        self.autostart_sw.grid(row=3, column=0, columnspan=3, sticky="w", padx=14, pady=4)
+        self.auto_update_sw = ctk.CTkSwitch(wn, text="Устанавливать обновления автоматически — когда очередь "
+                                                     "пуста; после обновления работа продолжится сама",
+                                            command=self.on_auto_update_switch)
+        if self.conf["auto_update"]:
+            self.auto_update_sw.select()
+        self.auto_update_sw.grid(row=4, column=0, columnspan=3, sticky="w", padx=14, pady=4)
+        if not core.FROZEN:
+            self.auto_update_sw.configure(state="disabled",
+                                          text="Автообновление — только в установленной версии (из установщика)")
+        ver = ctk.CTkFrame(wn, fg_color="transparent")
+        ver.grid(row=5, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 12))
+        ctk.CTkLabel(ver, text=f"Версия {core.VERSION}").pack(side="left")
+        ctk.CTkButton(ver, text="Проверить обновления", width=170, fg_color=GRAY, hover_color=GRAY_HOVER,
+                      command=lambda: self.check_updates(manual=True)).pack(side="left", padx=12)
+        self.update_check_lbl = ctk.CTkLabel(ver, text="", text_color="gray")
+        self.update_check_lbl.pack(side="left")
 
         bottom = ctk.CTkFrame(tab, fg_color="transparent")
         bottom.pack(fill="x", pady=(6, 0))
@@ -1366,6 +1519,10 @@ class App(ctk.CTk):
 
     def on_tray_switch(self):
         self.conf["close_to_tray"] = bool(self.tray_sw.get())
+        self.save()
+
+    def on_auto_update_switch(self):
+        self.conf["auto_update"] = bool(self.auto_update_sw.get())
         self.save()
 
     def on_autostart_switch(self):
@@ -1541,7 +1698,7 @@ class App(ctk.CTk):
         p = core.prompt_path(self.cfg)
         if p.exists():
             return p.read_text(encoding="utf-8")
-        example = BASE / "prompt.example.txt"
+        example = core.RES / "prompt.example.txt"
         return example.read_text(encoding="utf-8") if example.exists() else ""
 
     def load_prompt(self):
@@ -1677,15 +1834,7 @@ class App(ctk.CTk):
             return
         if self.prompt_dirty() and messagebox.askyesno("Промпт", "Сохранить изменения в промпте?"):
             self.save_prompt()
-        stops = [e._submit(e._stop()) for e in self.engines.values()]
-        for fut in stops:
-            try:
-                fut.result(timeout=5)
-            except Exception:
-                pass
-        shutil.rmtree(core.MEDIA_DIR, ignore_errors=True)
-        if self.tray:
-            self.tray.stop()
+        self.shutdown()
         self.destroy()
 
 
@@ -1695,8 +1844,14 @@ def run():
         return
     ctk.set_appearance_mode("system")
     ctk.set_default_color_theme("blue")
+    args = sys.argv[1:]
+    autostart = core.AUTOSTART_ARG in args
+    # После обновления установщик передаёт --run=1 (продолжить работу) и --tray=1 (окно было в трее)
+    resume = "--run=1" in args
     try:
-        App(autostart=core.AUTOSTART_ARG in sys.argv, instance=instance).mainloop()
+        App(hidden=autostart or "--tray=1" in args,
+            run_delay=core.AUTO_RUN_DELAY if autostart else 3 if resume else None,
+            updated="--updated" in args, instance=instance).mainloop()
     except Exception as e:
         logging.getLogger("autocomment").exception("Сбой")
         messagebox.showerror("TG Автокомментатор", f"Программа упала:\n{e}\n\nПодробности в log.txt")

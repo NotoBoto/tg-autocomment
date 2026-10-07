@@ -24,3 +24,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Сборка (python build.py)
+build/
+dist/

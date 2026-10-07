@@ -22,7 +22,15 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-BASE = Path(__file__).parent
+VERSION = "0.1.0"
+REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
+
+# Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
+# переустановка их не трогают. Запуск из исходников — всё рядом с app.py, как раньше.
+FROZEN = getattr(sys, "frozen", False)
+RES = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))   # файлы внутри программы
+BASE = (Path(os.environ.get("APPDATA") or Path.home()) / "TG Autocomment") if FROZEN else Path(__file__).parent
+BASE.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = BASE / "config.json"
 LEGACY_DONE_FILE = BASE / "done_posts.txt"   # до профилей был один общий файл
 MEDIA_DIR = BASE / "_post_media"
@@ -76,7 +84,8 @@ log = logging.getLogger("autocomment")
 
 
 # ---------- настройки ----------
-# config.json: {"profiles": [профиль, …], "current": id профиля, открытого в окне, "close_to_tray": bool}.
+# config.json: {"profiles": [профиль, …], "current": id профиля, открытого в окне,
+#               "close_to_tray": bool, "auto_update": bool}.
 # Профиль — один аккаунт Telegram со всеми своими настройками (ключи из DEFAULTS + "id").
 
 def load_config() -> dict:
@@ -93,7 +102,8 @@ def load_config() -> dict:
     profiles = [normalize_profile(p) for p in data["profiles"]] or [normalize_profile({"id": "main"})]
     ids = [p["id"] for p in profiles]
     return {"profiles": profiles, "current": data.get("current") if data.get("current") in ids else ids[0],
-            "close_to_tray": data.get("close_to_tray", True)}   # крестик прячет окно в трей
+            "close_to_tray": data.get("close_to_tray", True),   # крестик прячет окно в трей
+            "auto_update": data.get("auto_update", True)}       # ставить новые версии без вопросов
 
 
 def normalize_profile(p: dict) -> dict:
@@ -358,9 +368,11 @@ AUTO_RUN_DELAY = 30              # время на подключение VPN и
 
 
 def autostart_command() -> str:
+    if FROZEN:
+        return f'"{sys.executable}" {AUTOSTART_ARG}'
     exe = Path(sys.executable)
     pyw = exe.with_name("pythonw.exe")   # без чёрного окна консоли
-    return f'"{pyw if pyw.exists() else exe}" "{BASE / "app.py"}" {AUTOSTART_ARG}'
+    return f'"{pyw if pyw.exists() else exe}" "{Path(__file__).parent / "app.py"}" {AUTOSTART_ARG}'
 
 
 def get_autostart() -> str | None:
