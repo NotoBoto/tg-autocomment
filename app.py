@@ -82,18 +82,20 @@ def open_path(p: Path):
 # ======================================================================
 
 class LoginDialog(ctk.CTkToplevel):
-    def __init__(self, app: "App"):
+    def __init__(self, app: "App", engine: Engine):
         super().__init__(app)
-        self.app, self.engine = app, app.engine
-        self.title("Вход в Telegram")
+        self.app, self.engine = app, engine
+        multi = len(app.engines) > 1
+        self.title(f"Вход в Telegram — {engine.cfg['name']}" if multi else "Вход в Telegram")
         self.geometry("440x560")
         self.resizable(False, False)
         self.transient(app)
         self.protocol("WM_DELETE_WINDOW", self.cancel)
         self.after(100, self.grab_set)
 
-        ctk.CTkLabel(self, text="Войдите в аккаунт, от имени которого\nбудут публиковаться комментарии",
-                     font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(18, 8))
+        head = (f"Профиль «{engine.cfg['name']}»: войдите в аккаунт,\nот имени которого он будет комментировать"
+                if multi else "Войдите в аккаунт, от имени которого\nбудут публиковаться комментарии")
+        ctk.CTkLabel(self, text=head, font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(18, 8))
 
         self.tabs = ctk.CTkTabview(self, height=380)
         self.tabs.pack(fill="both", expand=True, padx=16)
@@ -165,6 +167,7 @@ class LoginDialog(ctk.CTkToplevel):
         self.grab_release()
         self.destroy()
         self.app.login_dialog = None
+        self.app.after(300, self.app.next_login)   # следующий аккаунт, которому нужен вход
 
     # события от движка
     def on_event(self, kind, data):
@@ -378,12 +381,14 @@ class App(ctk.CTk):
         super().__init__()
         self.log_q = setup_logging()
         first_run = not core.CONFIG_FILE.exists()
-        self.cfg = core.load_config()
-        if first_run:
-            core.save_config(self.cfg)
-        self.engine = Engine(self.cfg)
+        # Не self.config: это имя метода tkinter
+        self.conf = core.load_config()
+        self.save()   # заодно переводит старый config.json на профили
+        self.engines: dict[str, Engine] = {p["id"]: Engine(p) for p in self.conf["profiles"]}
+        self.update_show_names()
         self.login_dialog: LoginDialog | None = None
-        self.selected: str | None = None
+        self.login_waiting: list[str] = []   # профили, ждущие окна входа (оно одно на всех)
+        self.selected: str | None = None     # Pending.uid
         self.shown_comment: dict[str, str] = {}
         self.posted_count = 0
 
@@ -402,12 +407,197 @@ class App(ctk.CTk):
         self.statusbar = ctk.CTkLabel(self, text="", anchor="w", text_color="gray")
         self.statusbar.pack(fill="x", padx=16, pady=(0, 6))
 
-        self.set_status("stopped")
+        self.render_status()
         self.render_queue()
         if first_run or core.validate(self.cfg):
             self.tabs.set("Настройки")
             self.welcome.pack(fill="x", padx=4, pady=(0, 10), before=self.settings_first)
         self.after(100, self.poll)
+
+    # ------------------------------------------------------------------ профили
+
+    @property
+    def cfg(self) -> dict:
+        """Настройки профиля, открытого в окне (тот же словарь, что у его движка)."""
+        return self.profile(self.conf["current"])
+
+    @property
+    def engine(self) -> Engine:
+        return self.engines[self.conf["current"]]
+
+    def profile(self, pid: str) -> dict:
+        return next(p for p in self.conf["profiles"] if p["id"] == pid)
+
+    def save(self):
+        core.save_config(self.conf)
+
+    def update_show_names(self):
+        for e in self.engines.values():
+            e.show_name = len(self.engines) > 1
+
+    def _build_profile_bar(self):
+        pb = ctk.CTkFrame(self)
+        pb.pack(fill="x", padx=12, pady=(4, 0))
+        ctk.CTkLabel(pb, text="Аккаунт:").pack(side="left", padx=(12, 6), pady=8)
+        self.profile_menu = ctk.CTkOptionMenu(pb, values=["—"], width=200, command=self.on_profile_menu)
+        self.profile_menu.pack(side="left")
+        self.profile_state = ctk.CTkLabel(pb, text="", text_color="gray")
+        self.profile_state.pack(side="left", padx=12)
+        self.del_btn = ctk.CTkButton(pb, text="Удалить", width=80, fg_color=GRAY, hover_color=GRAY_HOVER,
+                                     command=self.delete_profile)
+        self.del_btn.pack(side="right", padx=(4, 10))
+        ctk.CTkButton(pb, text="Переименовать", width=120, fg_color=GRAY, hover_color=GRAY_HOVER,
+                      command=self.rename_profile).pack(side="right", padx=4)
+        ctk.CTkButton(pb, text="+ Добавить аккаунт", width=150,
+                      command=self.add_profile).pack(side="right", padx=4)
+        # Только при нескольких профилях
+        self.profile_run_btn = ctk.CTkButton(pb, text="", width=150, command=self.toggle_profile)
+        self.enabled_sw = ctk.CTkSwitch(pb, text="Запускать со всеми", command=self.on_enabled)
+
+    def render_profile_bar(self):
+        names = [p["name"] for p in self.conf["profiles"]]
+        self.profile_menu.configure(values=names)
+        self.profile_menu.set(self.cfg["name"])
+        e = self.engine
+        text, color = STATUS[e.status]
+        if e.status == "running" and e.me_name:
+            text += f" · {e.me_name}"
+        self.profile_state.configure(text=f"● {text}", text_color=color)
+        multi = len(names) > 1
+        self.del_btn.configure(state="normal" if multi else "disabled")
+        if multi:
+            active = e.status != "stopped"
+            self.profile_run_btn.configure(
+                text="■  Остановить этот" if active else "▶  Запустить только этот",
+                fg_color=RED if active else GREEN, hover_color="#b94541" if active else GREEN_HOVER)
+            self.enabled_sw.select() if self.cfg["enabled"] else self.enabled_sw.deselect()
+            self.profile_run_btn.pack(side="left", padx=(0, 8), after=self.profile_state)
+            self.enabled_sw.pack(side="left", after=self.profile_run_btn)
+        else:
+            self.profile_run_btn.pack_forget()
+            self.enabled_sw.pack_forget()
+
+    def leave_profile(self) -> bool:
+        """Перед переключением: сохраняем форму настроек и спрашиваем про промпт."""
+        if not self.apply_settings(silent=True):
+            return False
+        if self.prompt_dirty() and messagebox.askyesno(
+                "Промпт", f"Промпт профиля «{self.cfg['name']}» изменён, но не сохранён. Сохранить?"):
+            self.save_prompt()
+        return True
+
+    def on_profile_menu(self, name):
+        pid = next(p["id"] for p in self.conf["profiles"] if p["name"] == name)
+        if pid == self.conf["current"]:
+            return
+        if not self.leave_profile():
+            self.profile_menu.set(self.cfg["name"])
+            return
+        self.switch_profile(pid)
+
+    def switch_profile(self, pid):
+        self.conf["current"] = pid
+        self.save()
+        self.load_settings_form()
+        self.load_prompt()
+        self.load_header_switches()
+        self.update_channel_menu()
+        self.render_status()
+        self.render_queue()
+
+    def ask_name(self, title, text, initial="") -> str | None:
+        d = ctk.CTkInputDialog(title=title, text=text)
+        if initial:
+            d.after(150, lambda: d._entry.insert(0, initial))
+        name = (d.get_input() or "").strip()
+        if not name:
+            return None
+        if any(p["name"] == name for p in self.conf["profiles"]):
+            messagebox.showwarning(title, f"Профиль «{name}» уже есть — выберите другое название")
+            return None
+        return name
+
+    def add_profile(self):
+        if not self.leave_profile():
+            return
+        name = self.ask_name("Новый аккаунт", "Название профиля (например, имя аккаунта):")
+        if not name:
+            return
+        base = self.cfg
+        p = core.new_profile(self.conf, base, name)
+        self.engines[p["id"]] = Engine(p)
+        self.update_show_names()
+        self.switch_profile(p["id"])
+        log.info("Добавлен профиль «%s»", name)
+        messagebox.showinfo("Новый аккаунт", (
+            f"Настройки и промпт скопированы из «{base['name']}» — поменяйте, что нужно, "
+            "во вкладках «Настройки» и «Промпт».\n\n"
+            "Затем нажмите «▶ Запустить только этот» (или общий «▶ Запустить») — откроется вход "
+            "в Telegram для нового аккаунта."))
+
+    def rename_profile(self):
+        name = self.ask_name("Переименовать", "Новое название профиля:", self.cfg["name"])
+        if not name:
+            return
+        self.cfg["name"] = name
+        self.save()
+        self.render_profile_bar()
+        self.render_queue()
+
+    def delete_profile(self):
+        if len(self.engines) < 2:
+            return
+        p, e = self.cfg, self.engine
+        waiting = len(e.pending)
+        if not messagebox.askyesno("Удалить профиль", f"Удалить профиль «{p['name']}»?"
+                                   + (f"\n\nВ очереди от этого аккаунта: {waiting} — они пропадут." if waiting else "")):
+            return
+        try:
+            e._submit(e._stop()).result(timeout=5)
+        except Exception:
+            pass
+        session = BASE / f"{p['session_name']}.session"
+        if session.exists() and messagebox.askyesno("Файл сессии", (
+                f"Удалить и файл сессии {session.name}?\n\n"
+                "Он даёт полный доступ к аккаунту Telegram. Если аккаунт больше не нужен — лучше удалить; "
+                "чтобы вернуть его, придётся снова войти.")):
+            for f in (session, session.with_name(session.name + "-journal")):
+                f.unlink(missing_ok=True)
+        core.done_file(p).unlink(missing_ok=True)
+        if self.login_dialog and self.login_dialog.engine is e:
+            self.login_dialog.close()
+        self.login_waiting = [x for x in self.login_waiting if x != p["id"]]
+        self.conf["profiles"].remove(p)
+        del self.engines[p["id"]]
+        self.update_show_names()
+        log.info("Профиль «%s» удалён", p["name"])
+        self.switch_profile(self.conf["profiles"][0]["id"])
+
+    def on_enabled(self):
+        self.cfg["enabled"] = bool(self.enabled_sw.get())
+        self.save()
+
+    def toggle_profile(self):
+        """Запуск/остановка только открытого профиля — не трогая остальные."""
+        e = self.engine
+        if e.status != "stopped":
+            e.stop()
+            return
+        if not self.prepare_start():
+            return
+        problems = core.validate(self.cfg)
+        if problems:
+            messagebox.showwarning("Не всё настроено", "Перед запуском:\n\n• " + "\n• ".join(problems))
+            self.show_problem_tab(problems)
+            return
+        e.start()
+
+    def next_login(self):
+        """Окно входа одно — аккаунты, которым нужен вход, проходят его по очереди."""
+        while self.login_waiting and not self.login_dialog:
+            e = self.engines.get(self.login_waiting.pop(0))
+            if e and e.status == "login":
+                self.login_dialog = LoginDialog(self, e)
 
     # ------------------------------------------------------------------ шапка
 
@@ -427,27 +617,43 @@ class App(ctk.CTk):
         self.counter_lbl = ctk.CTkLabel(top, text="", text_color="gray")
         self.counter_lbl.pack(side="right", padx=14)
 
+        self._build_profile_bar()
         bar = ctk.CTkFrame(self)
         bar.pack(fill="x", padx=12, pady=(4, 6))
         ctk.CTkLabel(bar, text="Режим:").pack(side="left", padx=(12, 6), pady=8)
         self.mode = ctk.CTkSegmentedButton(bar, values=[MODE_CONFIRM, MODE_AUTO],
                                            command=self.on_mode)
-        self.mode.set(MODE_CONFIRM if self.cfg["confirm_before_post"] else MODE_AUTO)
         self.mode.pack(side="left")
         self.see_sw = ctk.CTkSwitch(bar, text="Нейронка смотрит картинки поста",
                                     command=self.on_see_images)
-        if self.cfg["send_post_images"]:
-            self.see_sw.select()
         self.see_sw.pack(side="left", padx=20)
         self.latest_btn = ctk.CTkButton(bar, text="Взять последний пост канала", width=200,
                                         fg_color=GRAY, hover_color=GRAY_HOVER,
                                         command=self.take_latest)
         self.latest_btn.pack(side="right", padx=10)
+        # Из какого канала брать последний пост (виден, только если каналов несколько)
+        self.latest_chan = ctk.CTkOptionMenu(bar, values=["—"], width=170)
+        self.load_header_switches()
+        self.update_channel_menu()
 
-    def set_status(self, st):
+    def load_header_switches(self):
+        """Режим и «смотрит картинки» — настройки открытого профиля."""
+        self.mode.set(MODE_CONFIRM if self.cfg["confirm_before_post"] else MODE_AUTO)
+        self.see_sw.select() if self.cfg["send_post_images"] else self.see_sw.deselect()
+
+    def render_status(self):
+        """Общий статус по всем аккаунтам: самый «требующий внимания» из их статусов."""
+        engines = list(self.engines.values())
+        states = {e.status for e in engines}
+        st = next((s for s in ("login", "connecting", "running") if s in states), "stopped")
         text, color = STATUS[st]
-        if st == "running" and getattr(self, "me_name", None):
-            text = f"Работает · {self.me_name} · @{self.cfg['channel']}"
+        running = [e for e in engines if e.status == "running"]
+        if st == "running" and len(engines) > 1:
+            text = f"Работает · аккаунтов: {len(running)} из {len(engines)}"
+        elif st == "running" and running[0].me_name:
+            chans = core.channels(self.cfg)
+            where = f"@{chans[0]}" if len(chans) == 1 else f"каналов: {len(chans)}"
+            text = f"Работает · {running[0].me_name} · {where}"
         self.status_dot.configure(text_color=color)
         self.status_lbl.configure(text=text)
         active = st != "stopped"
@@ -455,39 +661,77 @@ class App(ctk.CTk):
             text="■  Остановить" if active else "▶  Запустить",
             fg_color=RED if active else GREEN,
             hover_color="#b94541" if active else GREEN_HOVER)
-        self.latest_btn.configure(state="normal" if st == "running" else "disabled")
+        here = "normal" if self.engine.status == "running" else "disabled"
+        self.latest_btn.configure(state=here)
+        self.latest_chan.configure(state=here)
         self.status = st
+        self.render_profile_bar()
 
-    def toggle_run(self):
-        if self.status != "stopped":
-            self.engine.stop()
-            return
+    def prepare_start(self) -> bool:
         if not self.apply_settings(silent=True):
-            return
+            return False
         if self.prompt_dirty() and messagebox.askyesno(
                 "Промпт", "Промпт изменён, но не сохранён. Сохранить перед запуском?"):
             self.save_prompt()
-        problems = core.validate(self.cfg)
-        if problems:
-            messagebox.showwarning("Не всё настроено", "Перед запуском:\n\n• " + "\n• ".join(problems))
-            self.tabs.set("Промпт" if any("Промпт" in p for p in problems) and len(problems) == 1
-                          else "Настройки")
+        return True
+
+    def show_problem_tab(self, problems):
+        self.tabs.set("Промпт" if any("Промпт" in p for p in problems) and len(problems) == 1
+                      else "Настройки")
+
+    def toggle_run(self):
+        """Общая кнопка: запускает все профили с «Запускать со всеми» или останавливает все."""
+        if self.status != "stopped":
+            for e in self.engines.values():
+                if e.status != "stopped":
+                    e.stop()
             return
-        self.engine.start()
+        if not self.prepare_start():
+            return
+        targets = [p for p in self.conf["profiles"] if p["enabled"]]
+        if not targets:
+            messagebox.showwarning("Запуск", "Ни у одного аккаунта не включено «Запускать со всеми»")
+            return
+        multi = len(self.conf["profiles"]) > 1
+        for p in targets:
+            problems = core.validate(p)
+            if problems:
+                if p["id"] != self.conf["current"]:
+                    self.switch_profile(p["id"])
+                where = f" аккаунта «{p['name']}»" if multi else ""
+                messagebox.showwarning("Не всё настроено",
+                                       f"Перед запуском{where}:\n\n• " + "\n• ".join(problems))
+                self.show_problem_tab(problems)
+                return
+        for p in targets:
+            self.engines[p["id"]].start()
 
     def on_mode(self, value):
         self.cfg["confirm_before_post"] = value == MODE_CONFIRM
-        core.save_config(self.cfg)
-        log.info("Режим: %s", value.lower())
+        self.save()
+        log.info("Режим%s: %s", f" «{self.cfg['name']}»" if len(self.engines) > 1 else "", value.lower())
         self.render_queue()
 
     def on_see_images(self):
         self.cfg["send_post_images"] = bool(self.see_sw.get())
-        core.save_config(self.cfg)
+        self.save()
 
     def take_latest(self):
         self.tabs.set("Очередь")
-        self.engine.take_latest_post()
+        chans = core.channels(self.cfg)
+        self.engine.take_latest_post(self.latest_chan.get() if len(chans) > 1 else None)
+
+    def update_channel_menu(self):
+        chans = ["@" + c for c in core.channels(self.cfg)]
+        if len(chans) > 1:
+            self.latest_chan.configure(values=chans)
+            if self.latest_chan.get() not in chans:
+                self.latest_chan.set(chans[0])
+            self.latest_chan.pack(side="right", before=self.latest_btn)
+            self.latest_btn.configure(text="Взять последний пост из")
+        else:
+            self.latest_chan.pack_forget()
+            self.latest_btn.configure(text="Взять последний пост канала")
 
     # ------------------------------------------------------------------ очередь
 
@@ -559,8 +803,15 @@ class App(ctk.CTk):
                                       fg_color=GRAY, hover_color=GRAY_HOVER, command=self.skip)
         self.skip_btn.pack(side="left", padx=(8, 0))
 
+    def all_pending(self) -> dict[str, Pending]:
+        """Очередь всех аккаунтов вместе, по Pending.uid."""
+        return {p.uid: p for e in list(self.engines.values()) for p in list(e.pending.values())}
+
     def current(self) -> Pending | None:
-        return self.engine.pending.get(self.selected) if self.selected else None
+        return self.all_pending().get(self.selected) if self.selected else None
+
+    def owner(self, p: Pending) -> Engine:
+        return self.engines[p.profile]
 
     def save_draft(self):
         p = self.current()
@@ -573,17 +824,21 @@ class App(ctk.CTk):
         self.render_queue()
 
     def render_queue(self):
-        pending = self.engine.pending
+        pending = self.all_pending()
         if self.selected not in pending:
             self.selected = next(iter(pending), None)
 
+        multi = len(self.engines) > 1
         for w in self.list_frame.winfo_children():
             w.destroy()
         for key, p in pending.items():
             state = "⏳ генерирую…" if p.busy else ("⚠ ошибка" if p.error else "✓ готов")
             snippet = (p.post_text or "(только медиа)").replace("\n", " ")[:60]
+            if (multi or len(core.channels(self.owner(p).cfg)) > 1) and p.channel:
+                snippet = f"{p.channel} · {snippet}"
+            who = f"{self.owner(p).cfg['name']} · " if multi else ""
             ctk.CTkButton(
-                self.list_frame, text=f"#{p.post_id}  {state}\n{snippet}", anchor="w",
+                self.list_frame, text=f"{who}#{p.post_id}  {state}\n{snippet}", anchor="w",
                 height=56, corner_radius=8,
                 fg_color=BTN_COLOR if key == self.selected else ("gray80", "gray25"),
                 text_color=("white", "white") if key == self.selected else ("gray10", "gray90"),
@@ -616,7 +871,10 @@ class App(ctk.CTk):
         self.show_detail(p)
 
     def show_detail(self, p: Pending):
-        self.post_title.configure(text=f"Пост #{p.post_id}"
+        e = self.owner(p)
+        who = f"  ·  от имени «{e.cfg['name']}»" + (f" ({e.me_name})" if e.me_name else "")
+        self.post_title.configure(text=f"Пост #{p.post_id}" + (f"  ·  {p.channel}" if p.channel else "")
+                                       + (who if len(self.engines) > 1 else "")
                                        + (f"  ·  нейронка видит {len(p.post_images)} карт." if p.post_images else ""))
         self.post_box.configure(state="normal")
         self.post_box.delete("1.0", "end")
@@ -624,11 +882,11 @@ class App(ctk.CTk):
         self.post_box.configure(state="disabled")
 
         # Не затираем ручные правки, если текст от модели не менялся
-        if self.shown_comment.get(p.key) != p.comment or self.comment_box.get("1.0", "end-1c") == "":
+        if self.shown_comment.get(p.uid) != p.comment or self.comment_box.get("1.0", "end-1c") == "":
             self.comment_box.configure(state="normal")
             self.comment_box.delete("1.0", "end")
             self.comment_box.insert("1.0", p.comment)
-            self.shown_comment[p.key] = p.comment
+            self.shown_comment[p.uid] = p.comment
         self.show_image(p)
 
         if p.busy:
@@ -661,7 +919,7 @@ class App(ctk.CTk):
 
     def next_image(self):
         if p := self.current():
-            p.image = self.engine.pick_image(force=True)
+            p.image = self.owner(p).pick_image(force=True)
             if not p.image:
                 messagebox.showinfo("Картинки", "В папке картинок пусто. Укажите папку в «Настройках».")
             self.show_image(p)
@@ -669,7 +927,7 @@ class App(ctk.CTk):
     def choose_image(self):
         if p := self.current():
             f = filedialog.askopenfilename(
-                title="Картинка к комментарию", initialdir=core.images_path(self.cfg),
+                title="Картинка к комментарию", initialdir=core.images_path(self.owner(p).cfg),
                 filetypes=[("Картинки и видео", " ".join("*" + e for e in core.IMAGE_EXT))])
             if f:
                 p.image = Path(f)
@@ -682,7 +940,7 @@ class App(ctk.CTk):
 
     def regenerate(self):
         if p := self.current():
-            self.engine.regenerate(p.key, self.wish.get())
+            self.owner(p).regenerate(p.key, self.wish.get())
             self.wish.delete(0, "end")
 
     def publish(self):
@@ -691,11 +949,11 @@ class App(ctk.CTk):
             if not text:
                 messagebox.showwarning("Пусто", "Комментарий пустой")
                 return
-            self.engine.publish(p.key, text, p.image)
+            self.owner(p).publish(p.key, text, p.image)
 
     def skip(self):
         if p := self.current():
-            self.engine.skip(p.key)
+            self.owner(p).skip(p.key)
 
     # ------------------------------------------------------------------ настройки
 
@@ -712,7 +970,8 @@ class App(ctk.CTk):
             "1. Получите API ID и API Hash на my.telegram.org (раздел «API development tools»)\n"
             "2. Укажите канал, под постами которого нужно комментировать\n"
             "3. Заполните вкладку «Промпт» — инструкцию для нейросети\n"
-            "4. Нажмите «Сохранить», затем «▶ Запустить» — программа предложит войти в Telegram"
+            "4. Нажмите «Сохранить», затем «▶ Запустить» — программа предложит войти в Telegram\n"
+            "Нужно несколько аккаунтов? «+ Добавить аккаунт» вверху — у каждого свои настройки и промпт"
         )).pack(padx=14, pady=10, anchor="w")
 
         def section(title, hint=None):
@@ -746,7 +1005,11 @@ class App(ctk.CTk):
                       text_color=("#1f6aa5", "#5aa9e6"), hover=False, anchor="w",
                       command=lambda: webbrowser.open("https://my.telegram.org/apps")
                       ).grid(row=4, column=1, sticky="w")
-        field(tg, 5, "channel", "Канал", "username, @username или ссылка t.me/…")
+        ctk.CTkLabel(tg, text="Каналы").grid(row=5, column=0, sticky="nw", padx=14, pady=8)
+        self.channels_box = ctk.CTkTextbox(tg, height=86)
+        self.channels_box.grid(row=5, column=1, sticky="ew", padx=4, pady=5)
+        ctk.CTkLabel(tg, text="по одному на строку:\nusername, @username\nили ссылка t.me/…",
+                     text_color="gray", justify="left").grid(row=5, column=2, sticky="nw", padx=10, pady=5)
         field(tg, 6, "session_name", "Имя файла сессии", "менять не нужно", width=200)
 
         ai = section("Нейросеть")
@@ -934,6 +1197,8 @@ class App(ctk.CTk):
         for key, e in self.fields.items():
             e.delete(0, "end")
             e.insert(0, str(c.get(key, "")))
+        self.channels_box.delete("1.0", "end")
+        self.channels_box.insert("1.0", "\n".join(core.channels(c)))
         self.model.set(c["model"])
         self.api_model.set(c.get("api_model") or core.API_MODELS[0])
         self.gemini_model.set(c.get("gemini_model") or DEFAULT_MODEL)
@@ -984,8 +1249,14 @@ class App(ctk.CTk):
             new["delay_min_sec"], new["delay_max_sec"] = new["delay_max_sec"], new["delay_min_sec"]
         new["api_id"] = int(f["api_id"]) if f["api_id"].isdigit() else f["api_id"]
         new["api_hash"] = f["api_hash"]
-        new["channel"] = core.normalize_channel(f["channel"])
+        new["channels"] = core.channels({"channels": self.channels_box.get("1.0", "end").splitlines()})
         new["session_name"] = f["session_name"] or "my_account"
+        twin = next((p for p in self.conf["profiles"]
+                     if p is not self.cfg and p["session_name"] == new["session_name"]), None)
+        if twin:
+            messagebox.showerror("Настройки", f"Файл сессии «{new['session_name']}» уже занят профилем "
+                                              f"«{twin['name']}» — у каждого аккаунта должен быть свой")
+            return False
         new["images_dir"] = f["images_dir"] or "images"
         new["model"] = self.model.get() or "sonnet"
         new["backend"] = BACKENDS.get(self.backend.get(), "claude_code")
@@ -1002,12 +1273,13 @@ class App(ctk.CTk):
         new["attach_image_chance"] = round(self.chance.get() / 100, 2)
         new["skip_keywords"] = [w.strip() for w in self.keywords.get("1.0", "end").splitlines() if w.strip()]
 
-        restart_keys = ("api_id", "api_hash", "channel", "session_name")
-        needs_restart = self.status != "stopped" and any(new[k] != self.cfg[k] for k in restart_keys)
+        restart_keys = ("api_id", "api_hash", "channels", "session_name")
+        needs_restart = self.engine.status != "stopped" and any(new[k] != self.cfg[k] for k in restart_keys)
         if new["images_dir"] != self.cfg["images_dir"]:
             self.engine.reset_deck()
         self.cfg.update(new)   # тот же словарь, что у движка — изменения применяются сразу
-        core.save_config(self.cfg)
+        self.save()
+        self.update_channel_menu()
         self.load_settings_form()
         if not silent:
             self.welcome.pack_forget()
@@ -1101,30 +1373,35 @@ class App(ctk.CTk):
     def poll(self):
         while not self.log_q.empty():
             self.add_log(self.log_q.get_nowait())
-        while not self.engine.events.empty():
-            kind, data = self.engine.events.get_nowait()
-            self.handle(kind, data)
+        for e in list(self.engines.values()):
+            while not e.events.empty():
+                kind, data = e.events.get_nowait()
+                if e.cfg["id"] in self.engines:   # профиль могли удалить
+                    self.handle(e, kind, data)
         self.after(100, self.poll)
 
-    def handle(self, kind, data):
+    def handle(self, e: Engine, kind, data):
+        own_dialog = self.login_dialog if self.login_dialog and self.login_dialog.engine is e else None
         if kind == "status":
-            self.set_status(data)
-            if data == "stopped" and self.login_dialog:
-                self.login_dialog.close()
+            self.render_status()
+            if data == "stopped":
+                self.login_waiting = [x for x in self.login_waiting if x != e.cfg["id"]]
+                if own_dialog:
+                    own_dialog.close()
             self.render_queue()
         elif kind == "login_needed":
-            if not self.login_dialog:
-                self.login_dialog = LoginDialog(self)
+            self.login_waiting.append(e.cfg["id"])
+            self.next_login()
         elif kind in ("qr", "code_sent", "password_needed", "login_error"):
-            if self.login_dialog:
-                self.login_dialog.on_event(kind, data)
+            if own_dialog:
+                own_dialog.on_event(kind, data)
         elif kind == "me":
-            self.me_name = data
-            if self.login_dialog:
-                self.login_dialog.close()
+            if own_dialog:
+                own_dialog.close()
+            self.render_status()
         elif kind == "pending":
             if self.selected is None:
-                self.selected = data.key
+                self.selected = data.uid
             self.tabs.set("Очередь")
             self.render_queue()
             self.bell()
@@ -1132,8 +1409,9 @@ class App(ctk.CTk):
             self.render_queue()
         elif kind == "pending_done":
             key, result = data
-            self.shown_comment.pop(key, None)
-            if self.selected == key:
+            uid = f"{e.cfg['id']}|{key}"
+            self.shown_comment.pop(uid, None)
+            if self.selected == uid:
                 self.selected = None
             self.render_queue()
             if result == "published":
@@ -1143,15 +1421,18 @@ class App(ctk.CTk):
             self.counter_lbl.configure(text=f"Опубликовано за сессию: {self.posted_count}")
 
     def on_close(self):
-        if self.engine.pending and not messagebox.askyesno(
-                "Выход", f"В очереди {len(self.engine.pending)} непроверенных комментариев. Выйти?"):
+        waiting = len(self.all_pending())
+        if waiting and not messagebox.askyesno(
+                "Выход", f"В очереди {waiting} непроверенных комментариев. Выйти?"):
             return
         if self.prompt_dirty() and messagebox.askyesno("Промпт", "Сохранить изменения в промпте?"):
             self.save_prompt()
-        try:
-            self.engine._submit(self.engine._stop()).result(timeout=5)
-        except Exception:
-            pass
+        stops = [e._submit(e._stop()) for e in self.engines.values()]
+        for fut in stops:
+            try:
+                fut.result(timeout=5)
+            except Exception:
+                pass
         shutil.rmtree(core.MEDIA_DIR, ignore_errors=True)
         self.destroy()
 

@@ -12,20 +12,19 @@ import os
 import queue
 import random
 import re
+import secrets
 import shutil
 import subprocess
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from telethon import TelegramClient, events, errors
+from telethon import TelegramClient, events, errors, utils
 
 BASE = Path(__file__).parent
 CONFIG_FILE = BASE / "config.json"
-DONE_FILE = BASE / "done_posts.txt"
+LEGACY_DONE_FILE = BASE / "done_posts.txt"   # до профилей был один общий файл
 MEDIA_DIR = BASE / "_post_media"
-# Промпт передаём файлом: многострочный текст в аргументах ломается в cmd.exe
-SYSTEM_PROMPT_FILE = BASE / "_system_prompt.txt"
 
 IMAGE_EXT = {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".gif", ".bmp", ".mp4"}
 MODELS = ["sonnet", "opus", "haiku"]          # для Claude Code
@@ -41,10 +40,12 @@ SKIP_RULE = (
 )
 
 DEFAULTS = {
+    "name": "Основной",            # название профиля (аккаунта) в окне
+    "enabled": True,               # запускать ли профиль кнопкой «▶ Запустить»
     "api_id": "",
     "api_hash": "",
     "session_name": "my_account",
-    "channel": "",
+    "channels": [],                # каналы, за которыми следим
     "backend": "claude_code",      # claude_code | api (Anthropic) | gemini_cli (Antigravity) | gemini_api | codex | openai_api
     "model": "sonnet",
     "api_key": "",
@@ -72,15 +73,53 @@ log = logging.getLogger("autocomment")
 
 
 # ---------- настройки ----------
+# config.json: {"profiles": [профиль, …], "current": id профиля, открытого в окне}.
+# Профиль — один аккаунт Telegram со всеми своими настройками (ключи из DEFAULTS + "id").
 
 def load_config() -> dict:
-    cfg = dict(DEFAULTS)
+    data = {}
     if CONFIG_FILE.exists():
         try:
-            cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         except json.JSONDecodeError as e:
             log.error("config.json повреждён (%s) — взяты значения по умолчанию", e)
+    if "profiles" not in data:   # старый конфиг с одним аккаунтом → профиль «Основной»
+        data = {"profiles": [dict(data, id="main")], "current": "main"}
+        if LEGACY_DONE_FILE.exists() and not done_file({"id": "main"}).exists():
+            LEGACY_DONE_FILE.rename(done_file({"id": "main"}))
+    profiles = [normalize_profile(p) for p in data["profiles"]] or [normalize_profile({"id": "main"})]
+    ids = [p["id"] for p in profiles]
+    return {"profiles": profiles, "current": data.get("current") if data.get("current") in ids else ids[0]}
+
+
+def normalize_profile(p: dict) -> dict:
+    cfg = dict(DEFAULTS)
+    cfg.update(p)
+    cfg["channels"] = channels(cfg)
+    cfg.pop("channel", None)
     return cfg
+
+
+def new_profile(config: dict, base: dict, name: str) -> dict:
+    """Новый профиль — копия настроек base, но со своей сессией, промптом и списком сделанного."""
+    # Случайный id: у удалённого профиля и нового не совпадут файлы (сделанные посты, промпт)
+    pid = secrets.token_hex(3)
+    p = dict(base, id=pid, name=name, enabled=True,
+             session_name=f"account_{pid}", prompt_file=f"prompt_{pid}.txt")
+    if prompt_path(base).exists():
+        prompt_path(p).write_text(prompt_path(base).read_text(encoding="utf-8"), encoding="utf-8")
+    config["profiles"].append(p)
+    return p
+
+
+def done_file(cfg) -> Path:
+    return BASE / f"done_posts_{cfg['id']}.txt"
+
+
+def channels(cfg) -> list[str]:
+    """Список каналов; старый конфиг с одним "channel" тоже понимаем."""
+    chans = cfg.get("channels") or ([cfg["channel"]] if cfg.get("channel") else [])
+    return list(dict.fromkeys(c for c in (normalize_channel(c) for c in chans) if c))
 
 
 def save_config(cfg: dict):
@@ -188,8 +227,8 @@ def validate(cfg) -> list[str]:
         problems.append("Не указан API ID (число с my.telegram.org)")
     if not str(cfg.get("api_hash", "")).strip():
         problems.append("Не указан API Hash (с my.telegram.org)")
-    if not cfg.get("channel"):
-        problems.append("Не указан канал")
+    if not channels(cfg):
+        problems.append("Не указан ни один канал")
     p = prompt_path(cfg)
     if not p.exists() or not p.read_text(encoding="utf-8").strip():
         problems.append("Промпт пустой — заполните вкладку «Промпт»")
@@ -242,7 +281,6 @@ def decode_any(data: bytes) -> str:
 # С 18.06.2026 Gemini CLI не обслуживает личные Google-аккаунты — вместо него agy.
 
 AGY_DEFAULT = Path(os.environ.get("LOCALAPPDATA", "")) / "agy" / "bin" / "agy.exe"
-AGY_WORKSPACE = BASE / "_agy_workspace"   # пустая папка: agy не видит файлы проекта
 AGY_AGENT = "autocomment"
 
 
@@ -322,7 +360,6 @@ def check_gemini_key(cfg) -> tuple[bool, str, list[str]]:
 NPM_GLOBAL = Path(os.environ.get("APPDATA", "")) / "npm"
 NODE_DEFAULT = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "nodejs"
 CODEX_DIR = Path.home() / ".codex"
-CODEX_WORKSPACE = BASE / "_codex_workspace"   # пустая папка: Codex не видит файлы проекта
 # Лишние для комментариев возможности Codex: меньше служебного текста — меньше расход лимита
 CODEX_FEATURES_OFF = ["apps", "plugins", "multi_agent", "image_generation", "browser_use",
                       "computer_use", "goals", "shell_tool", "unified_exec"]
@@ -449,17 +486,33 @@ class Pending:
     chat_id: int
     post_id: int
     post_text: str
+    channel: str = ""        # @username или название канала
+    profile: str = ""        # id профиля, от имени которого комментарий
     post_images: list[Path] = field(default_factory=list)
     comment: str = ""
     image: Path | None = None
     busy: bool = False       # идёт генерация/отправка
     error: str = ""
 
+    @property
+    def uid(self) -> str:
+        """Ключ, уникальный среди всех профилей (один пост может ждать у нескольких аккаунтов)."""
+        return f"{self.profile}|{self.key}"
+
 
 # ---------- движок ----------
 
+class ProfileLog(logging.LoggerAdapter):
+    """Записи движка помечаются именем профиля, если профилей несколько."""
+
+    def process(self, msg, kwargs):
+        e = self.extra["engine"]
+        return (f"[{e.cfg['name']}] {msg}" if e.show_name else msg), kwargs
+
+
 class Engine:
     """
+    Один профиль = один Engine: свой аккаунт Telegram, свой поток и своя очередь.
     Все публичные методы вызываются из потока окна и безопасны:
     работа уходит в asyncio-цикл фонового потока.
     События для окна кладутся в self.events:
@@ -478,12 +531,22 @@ class Engine:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        self.log = ProfileLog(log, {"engine": self})
+        self.show_name = False   # окно включает, когда профилей больше одного
+        pid = cfg["id"]
+        self.done_file = done_file(cfg)
+        self.media_dir = MEDIA_DIR / pid
+        # Промпт передаём файлом: многострочный текст в аргументах ломается в cmd.exe
+        self.system_prompt_file = BASE / f"_system_prompt_{pid}.txt"
+        # Пустые рабочие папки: agy и Codex не видят файлы проекта
+        self.agy_workspace = BASE / f"_agy_workspace_{pid}"
+        self.codex_workspace = BASE / f"_codex_workspace_{pid}"
         self.events: queue.Queue = queue.Queue()
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self.client: TelegramClient | None = None
         self.pending: dict[str, Pending] = {}
-        self.done_posts = set(DONE_FILE.read_text().split()) if DONE_FILE.exists() else set()
+        self.done_posts = set(self.done_file.read_text().split()) if self.done_file.exists() else set()
         self._image_bag: list[Path] = []
         self._seen_groups: set[int] = set()
         self._gen_lock: asyncio.Lock | None = None
@@ -495,11 +558,18 @@ class Engine:
         self._openai_client_key = None
         self._qr_task: asyncio.Task | None = None
         self._phone = ""
+        self.channel_names: dict[int, str] = {}
         self.running = False
+        self.status = "stopped"
+        self.me_name = ""
 
     # --- служебное ---
 
     def _emit(self, kind, data=None):
+        if kind == "status":
+            self.status = data
+        elif kind == "me":
+            self.me_name = data
         self.events.put((kind, data))
 
     def _submit(self, coro):
@@ -509,7 +579,7 @@ class Engine:
 
     def _report_crash(self, fut):
         if not fut.cancelled() and fut.exception():
-            log.error("Ошибка: %s", fut.exception())
+            self.log.error("Ошибка: %s", fut.exception())
 
     # --- запуск / остановка / вход ---
 
@@ -532,7 +602,7 @@ class Engine:
         except Exception as e:
             self.client = None
             self._emit("status", "stopped")
-            log.error("Не удалось подключиться к Telegram: %s", e)
+            self.log.error("Не удалось подключиться к Telegram: %s", e)
             return
         if await self.client.is_user_authorized():
             await self._after_login()
@@ -550,7 +620,7 @@ class Engine:
         for p in list(self.pending.values()):
             self._finish(p, "skipped")
         if self.running:
-            log.info("Остановлено")
+            self.log.info("Остановлено")
         self.running = False
         self._emit("status", "stopped")
 
@@ -616,19 +686,26 @@ class Engine:
     async def _after_login(self):
         cfg = self.cfg
         me = await self.client.get_me()
-        try:
-            await self.client.get_entity(cfg["channel"])
-        except Exception as e:
-            log.error("Канал @%s не найден: %s", cfg["channel"], e)
+        entities = []
+        self.channel_names = {}
+        for name in channels(cfg):
+            try:
+                ent = await self.client.get_entity(name)
+            except Exception as e:
+                self.log.error("Канал @%s не найден — пропускаю: %s", name, e)
+                continue
+            entities.append(ent)
+            self.channel_names[utils.get_peer_id(ent)] = "@" + (getattr(ent, "username", None) or name)
+        if not entities:
+            self.log.error("Ни один канал не найден — проверьте список в «Настройках»")
             await self._stop()
             return
-        self.client.add_event_handler(self._on_new_post,
-                                      events.NewMessage(chats=cfg["channel"]))
+        self.client.add_event_handler(self._on_new_post, events.NewMessage(chats=entities))
         self.running = True
         self._emit("me", me.first_name)
         self._emit("status", "running")
-        log.info("Вошли как %s, слушаю канал @%s", me.first_name, cfg["channel"])
-        log.info("Картинок для комментариев: %d", len(list_images(cfg)))
+        self.log.info("Вошли как %s, слушаю каналы: %s", me.first_name, ", ".join(self.channel_names.values()))
+        self.log.info("Картинок для комментариев: %d", len(list_images(cfg)))
 
     # --- картинки ---
 
@@ -677,7 +754,7 @@ class Engine:
                 if path:
                     files.append(Path(path))
             except Exception as e:
-                log.warning("Не удалось скачать медиа из #%s: %s", m.id, e)
+                self.log.warning("Не удалось скачать медиа из #%s: %s", m.id, e)
         return files
 
     def _is_sensitive(self, text: str) -> str | None:
@@ -687,12 +764,13 @@ class Engine:
     async def _on_new_post(self, event):
         await self._handle_post(event.message, manual=False)
 
-    def take_latest_post(self):
+    def take_latest_post(self, channel: str | None = None):
         """Взять последний пост канала — удобно, чтобы проверить промпт."""
         async def go():
-            msgs = await self.client.get_messages(self.cfg["channel"], limit=1)
+            name = normalize_channel(channel or "") or channels(self.cfg)[0]
+            msgs = await self.client.get_messages(name, limit=1)
             if not msgs:
-                log.warning("В канале нет постов")
+                self.log.warning("В канале @%s нет постов", name)
                 return
             await self._handle_post(msgs[0], manual=True)
         self._submit(go())
@@ -707,28 +785,30 @@ class Engine:
         post_id, post_text, parts = await self._collect_post(msg)
         key = f"{msg.chat_id}:{post_id}"
         if key in self.pending:
-            log.info("Пост #%s уже в очереди", post_id)
+            self.log.info("Пост #%s уже в очереди", post_id)
             return
         if key in self.done_posts:
             if not manual:
                 return
-            log.warning("Под постом #%s уже есть ваш комментарий", post_id)
-        log.info("Новый пост #%s: %s", post_id, post_text[:80].replace("\n", " "))
+            self.log.warning("Под постом #%s уже есть ваш комментарий", post_id)
+        chan = self.channel_names.get(msg.chat_id, "")
+        self.log.info("Новый пост %s #%s: %s", chan, post_id, post_text[:80].replace("\n", " "))
 
         see_images = cfg.get("send_post_images", False)
         has_media = any(m.photo or m.video or m.gif for m in parts)
         if not post_text.strip() and not (see_images and has_media):
-            log.info("Пост #%s без текста — пропуск", post_id)
+            self.log.info("Пост #%s без текста — пропуск", post_id)
             return
         word = self._is_sensitive(post_text)
         if word and not manual:
-            log.info("Пост #%s: стоп-слово «%s» — пропуск", post_id, word)
+            self.log.info("Пост #%s: стоп-слово «%s» — пропуск", post_id, word)
             return
 
-        p = Pending(key=key, chat_id=msg.chat_id, post_id=post_id, post_text=post_text)
+        p = Pending(key=key, chat_id=msg.chat_id, post_id=post_id, post_text=post_text, channel=chan,
+                    profile=self.cfg["id"])
         if see_images and has_media:
-            p.post_images = await self._download_post_images(parts, MEDIA_DIR / str(post_id))
-            log.info("Картинок из поста для нейронки: %d", len(p.post_images))
+            p.post_images = await self._download_post_images(parts, self.media_dir / str(post_id))
+            self.log.info("Картинок из поста для нейронки: %d", len(p.post_images))
 
         confirm = manual or cfg.get("confirm_before_post", True)
         if confirm:
@@ -739,12 +819,12 @@ class Engine:
         try:
             p.comment = await self._generate(post_text, p.post_images) or ""
         except Exception as e:
-            log.error("Ошибка Claude Code: %s", e)
+            self.log.error("Ошибка Claude Code: %s", e)
             p.error = str(e)
         p.image = self.pick_image()
 
         if not p.comment and not p.error:
-            log.info("Пост #%s: модель решила пропустить (SKIP)", post_id)
+            self.log.info("Пост #%s: модель решила пропустить (SKIP)", post_id)
             if not confirm:
                 self._cleanup(p)
                 return
@@ -759,7 +839,7 @@ class Engine:
             self._cleanup(p)
             return
         delay = random.randint(cfg["delay_min_sec"], max(cfg["delay_min_sec"], cfg["delay_max_sec"]))
-        log.info("Пост #%s: жду %s сек перед публикацией", post_id, delay)
+        self.log.info("Пост #%s: жду %s сек перед публикацией", post_id, delay)
         await asyncio.sleep(delay)
         await self._send(p)
         self._cleanup(p)
@@ -780,9 +860,9 @@ class Engine:
 
     async def _gen_claude_code(self, system: str, user_msg: str, images: list[Path]) -> str:
         cfg = self.cfg
-        SYSTEM_PROMPT_FILE.write_text(system, encoding="utf-8")
+        self.system_prompt_file.write_text(system, encoding="utf-8")
         args = [find_claude(), "-p",
-                "--system-prompt-file", str(SYSTEM_PROMPT_FILE),
+                "--system-prompt-file", str(self.system_prompt_file),
                 "--model", cfg.get("model", "sonnet"),
                 "--output-format", "text"]
         cwd = None
@@ -823,7 +903,7 @@ class Engine:
     async def _gen_gemini_cli(self, system: str, user_msg: str, images: list[Path]) -> str:
         """Antigravity CLI: наш промпт кладём как отдельного агента в пустую рабочую папку."""
         cfg = self.cfg
-        ws = AGY_WORKSPACE
+        ws = self.agy_workspace
         shutil.rmtree(ws, ignore_errors=True)
         agent_dir = ws / ".agents" / "agents" / AGY_AGENT
         agent_dir.mkdir(parents=True)
@@ -902,17 +982,17 @@ class Engine:
             raise RuntimeError(f"Нет связи с Gemini API: {e}")
         u = resp.usage_metadata
         if u:
-            log.info("Gemini %s: вход %s ток., выход %s ток.", model,
+            self.log.info("Gemini %s: вход %s ток., выход %s ток.", model,
                      u.prompt_token_count, (u.candidates_token_count or 0) + (u.thoughts_token_count or 0))
         if not resp.text:
-            log.info("Gemini не вернул текст (сработал фильтр безопасности или пустой ответ)")
+            self.log.info("Gemini не вернул текст (сработал фильтр безопасности или пустой ответ)")
             return ""
         return resp.text.strip()
 
     async def _gen_codex(self, system: str, user_msg: str, images: list[Path]) -> str:
         """Codex CLI по подписке ChatGPT: наш промпт заменяет встроенные инструкции Codex."""
         cfg = self.cfg
-        ws = CODEX_WORKSPACE
+        ws = self.codex_workspace
         shutil.rmtree(ws, ignore_errors=True)
         ws.mkdir(parents=True)
         instr, last = ws / "instructions.md", ws / "last_message.txt"
@@ -993,7 +1073,7 @@ class Engine:
         u = resp.usage
         if u:
             cached = getattr(u.input_tokens_details, "cached_tokens", 0) if u.input_tokens_details else 0
-            log.info("OpenAI %s: вход %s ток. (из кэша %s), выход %s ток.", model,
+            self.log.info("OpenAI %s: вход %s ток. (из кэша %s), выход %s ток.", model,
                      u.input_tokens, cached, u.output_tokens)
         return (resp.output_text or "").strip()
 
@@ -1049,11 +1129,11 @@ class Engine:
             raise RuntimeError(f"Ошибка API ({e.status_code}): {e.message}")
 
         u = resp.usage
-        log.info("API %s: вход %s ток. (из кэша %s), выход %s ток.", resp.model,
+        self.log.info("API %s: вход %s ток. (из кэша %s), выход %s ток.", resp.model,
                  u.input_tokens + (u.cache_creation_input_tokens or 0) + (u.cache_read_input_tokens or 0),
                  u.cache_read_input_tokens or 0, u.output_tokens)
         if resp.stop_reason == "refusal":
-            log.info("Модель отказалась отвечать на этот пост")
+            self.log.info("Модель отказалась отвечать на этот пост")
             return ""
         return "".join(b.text for b in resp.content if b.type == "text").strip()
 
@@ -1064,16 +1144,16 @@ class Engine:
                     p.chat_id, p.comment, comment_to=p.post_id,
                     file=str(p.image) if p.image else None,
                 )
-                log.info("✅ Комментарий опубликован под #%s (картинка: %s)",
+                self.log.info("✅ Комментарий опубликован под #%s (картинка: %s)",
                          p.post_id, p.image.name if p.image else "нет")
                 self.done_posts.add(p.key)
-                with DONE_FILE.open("a") as f:
+                with self.done_file.open("a") as f:
                     f.write(p.key + "\n")
                 self._emit("posted")
                 return True
             except errors.FloodWaitError as e:
                 if attempt == 0 and e.seconds <= 300:
-                    log.warning("Telegram просит подождать %s сек — подожду и повторю", e.seconds)
+                    self.log.warning("Telegram просит подождать %s сек — подожду и повторю", e.seconds)
                     await asyncio.sleep(e.seconds + 1)
                     continue
                 p.error = f"Telegram ограничил отправку на {e.seconds} сек"
@@ -1081,7 +1161,7 @@ class Engine:
                 p.error = "У поста нет обсуждения (комментарии выключены)"
             except Exception as e:
                 p.error = f"Не удалось отправить: {e}"
-            log.error("Пост #%s: %s", p.post_id, p.error)
+            self.log.error("Пост #%s: %s", p.post_id, p.error)
             return False
         return False
 
@@ -1129,7 +1209,7 @@ class Engine:
         async def go():
             p = self.pending.get(key)
             if p and not p.busy:
-                log.info("Пост #%s пропущен вручную", p.post_id)
+                self.log.info("Пост #%s пропущен вручную", p.post_id)
                 self._finish(p, "skipped")
         self._submit(go())
 

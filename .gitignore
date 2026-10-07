@@ -2,17 +2,18 @@
 config.json
 *.session
 *.session-journal
-prompt.txt
+prompt*.txt
+!prompt.example.txt
 .env
 
 # Рабочие файлы программы
 log.txt
 *.log
-done_posts.txt
-_system_prompt.txt
+done_posts*.txt
+_system_prompt*.txt
 _post_media/
-_agy_workspace/
-_codex_workspace/
+_agy_workspace*/
+_codex_workspace*/
 
 # Свои картинки (папка остаётся пустой)
 images/*
