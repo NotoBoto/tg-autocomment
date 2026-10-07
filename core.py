@@ -22,7 +22,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -106,7 +106,9 @@ def load_config() -> dict:
     ids = [p["id"] for p in profiles]
     return {"profiles": profiles, "current": data.get("current") if data.get("current") in ids else ids[0],
             "close_to_tray": data.get("close_to_tray", True),   # крестик прячет окно в трей
-            "auto_update": data.get("auto_update", True)}       # ставить новые версии без вопросов
+            "auto_update": data.get("auto_update", True),       # ставить новые версии без вопросов
+            # id профилей, работавших перед автообновлением, — их и запустить после него
+            "resume_profiles": data.get("resume_profiles", [])}
 
 
 def normalize_profile(p: dict) -> dict:
@@ -732,7 +734,8 @@ def check_compat(cfg) -> tuple[bool, str, list[str]]:
     if not url:
         return False, "Адрес сервера не указан", []
     try:
-        models = sorted(m.id for m in compat_client(cfg).models.list())
+        with compat_client(cfg) as client:
+            models = sorted(m.id for m in client.models.list())
     except openai.APIConnectionError:
         return False, compat_connection_hint(url), []
     except openai.AuthenticationError:
@@ -752,6 +755,18 @@ def check_compat(cfg) -> tuple[bool, str, list[str]]:
 
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)   # «размышления» DeepSeek-R1, Qwen3 и т. п.
+
+
+def strip_reasoning(text: str) -> str:
+    """Убирает «размышления» модели из ответа. Незакрытый <think> — ответ обрезан, публиковать нельзя."""
+    text = THINK_RE.sub("", text)
+    low = text.lower()
+    if "</think>" in low:   # открывающий тег бывает в шаблоне модели, а в ответе только закрывающий
+        text = text[low.rindex("</think>") + len("</think>"):]
+    elif "<think>" in low:
+        raise RuntimeError("Модель не закончила размышлять — ответ обрезан. Увеличьте лимит длины ответа "
+                           "и контекст модели или возьмите модель без режима размышлений")
+    return text.strip()
 
 
 # ---------- пост, ожидающий решения ----------
@@ -834,6 +849,7 @@ class Engine:
         self._openai_client_key = None
         self._qr_task: asyncio.Task | None = None
         self._dialogs_loaded = False   # список чатов подгружен (нужен, чтобы найти закрытый канал по id)
+        self.inflight: set[str] = set()   # ключи постов, которые сейчас обрабатываются
         self._phone = ""
         self.channel_names: dict[int, str] = {}
         self.running = False
@@ -865,6 +881,14 @@ class Engine:
 
     def stop(self):
         self._submit(self._stop())
+
+    def close(self):
+        """Окончательно: отключиться и остановить поток движка (профиль удаляют)."""
+        try:
+            self._submit(self._stop()).result(timeout=5)
+        except Exception:
+            pass
+        self.loop.call_soon_threadsafe(self.loop.stop)
 
     async def _start(self):
         if self.client:
@@ -1171,11 +1195,25 @@ class Engine:
 
         p = Pending(key=key, chat_id=msg.chat_id, post_id=post_id, post_text=post_text, channel=chan,
                     profile=self.cfg["id"])
-        if see_images and has_media:
+        # Пока пост в работе (генерация, пауза перед автопубликацией), выход и автообновление ждут
+        self.inflight.add(key)
+        try:
+            await self._comment_on(p, parts, manual or cfg.get("confirm_before_post", True),
+                                   see_images and has_media)
+        finally:
+            self.inflight.discard(key)
+
+    def busy_auto(self) -> int:
+        """Сколько постов в работе вне очереди подтверждения — автопубликация ещё не закончена."""
+        return len(self.inflight - self.pending.keys())
+
+    async def _comment_on(self, p: Pending, parts, confirm: bool, with_images: bool):
+        cfg, post_id = self.cfg, p.post_id
+        if with_images:
             p.post_images = await self._download_post_images(parts, self.media_dir / str(post_id))
             self.log.info("Картинок из поста для нейронки: %d", len(p.post_images))
 
-        confirm = manual or cfg.get("confirm_before_post", True)
+        key, post_text = p.key, p.post_text
         if confirm:
             p.busy = True
             self.pending[key] = p
@@ -1448,7 +1486,7 @@ class Engine:
         if u:
             self.log.info("Своя модель %s: вход %s ток., выход %s ток.", model, u.prompt_tokens, u.completion_tokens)
         text = (resp.choices[0].message.content or "") if resp.choices else ""
-        return THINK_RE.sub("", text).strip()
+        return strip_reasoning(text)
 
     async def _gen_openai_api(self, system: str, user_msg: str, images: list[Path]) -> str:
         import openai

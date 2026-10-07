@@ -8,6 +8,7 @@ import shutil
 import socket
 import sys
 import threading
+import time
 import webbrowser
 import zlib
 from pathlib import Path
@@ -130,7 +131,7 @@ def tray_image(color: str, size: int = 64) -> Image.Image:
 
 class Tray:
     """Значок в трее: окно можно закрыть, а программа продолжит работать.
-    Меню pystray работает в своём потоке — действия передаём в окно через app.after."""
+    Меню pystray работает в своём потоке — действия передаём в окно через app.call_soon."""
 
     def __init__(self, app: "App"):
         import pystray
@@ -138,11 +139,11 @@ class Tray:
         item = pystray.MenuItem
         self.icon = pystray.Icon("tg_autocomment", tray_image(STATUS["stopped"][1]), "TG Автокомментатор",
                                  pystray.Menu(
-                                     item("Открыть", lambda: app.after(0, app.show_window), default=True),
+                                     item("Открыть", lambda: app.call_soon(app.show_window), default=True),
                                      item(lambda i: "■  Остановить" if app.status != "stopped" else "▶  Запустить",
-                                          lambda: app.after(0, app.toggle_run)),
+                                          lambda: app.call_soon(app.toggle_run)),
                                      pystray.Menu.SEPARATOR,
-                                     item("Выход", lambda: app.after(0, app.quit_app))))
+                                     item("Выход", lambda: app.call_soon(app.quit_app))))
         self.color = STATUS["stopped"][1]
         self.icon.run_detached()
 
@@ -491,9 +492,11 @@ class App(ctk.CTk):
         if icon.exists():
             self.iconbitmap(str(icon))
         self.log_q = setup_logging()
+        self.ui_q: queue.Queue = queue.Queue()   # задания для окна из фоновых потоков (call_soon)
         first_run = not core.CONFIG_FILE.exists()
         # Не self.config: это имя метода tkinter
         self.conf = core.load_config()
+        resume = self.conf.pop("resume_profiles", None) or []   # записано перед автообновлением
         self.save()   # заодно переводит старый config.json на профили
         self.engines: dict[str, Engine] = {p["id"]: Engine(p) for p in self.conf["profiles"]}
         self.update_show_names()
@@ -528,9 +531,10 @@ class App(ctk.CTk):
             self.tray_sw.configure(state="disabled")
         self.render_status()
         self.render_queue()
-        if first_run or core.validate(self.cfg):
-            self.tabs.set("Настройки")
-            self.welcome.pack(fill="x", padx=4, pady=(0, 10), before=self.settings_first)
+        if first_run:
+            self.show_welcome()
+        else:   # чего-то не хватает для запуска — тоже покажем подсказки (проверка идёт в фоне)
+            self.validate_async([self.cfg], lambda res: res[0][1] and self.show_welcome())
         if instance:
             threading.Thread(target=self.listen_instances, args=(instance,), daemon=True).start()
         # Программу перенесли в другую папку или сменили Python — обновляем команду автозапуска
@@ -547,7 +551,9 @@ class App(ctk.CTk):
                 self.tray.notify(f"Программа обновлена до версии {core.VERSION}")
         if run_delay is not None:
             log.info("Начну работу через %d сек", run_delay)
-            self.after(run_delay * 1000, self.auto_run)
+            # После обновления — только аккаунты, работавшие до него (старые версии их не записывали)
+            only = set(resume) if updated and resume else None
+            self.after(run_delay * 1000, lambda: self.auto_run(only))
         self.update_info: updater.Update | None = None
         self.updating = False
         self.after(15_000, self.check_updates)
@@ -599,7 +605,8 @@ class App(ctk.CTk):
 
     def can_update_quietly(self) -> bool:
         """Сами ставим обновление, только если ничего не прервём: очередь пуста, промпт сохранён, нет входа."""
-        return not self.all_pending() and not self.prompt_dirty() and not self.login_dialog
+        return (not self.all_pending() and not self.prompt_dirty() and not self.login_dialog
+                and not any(e.busy_auto() for e in self.engines.values()))
 
     def show_update_bar(self):
         u = self.update_info
@@ -621,7 +628,7 @@ class App(ctk.CTk):
         log.info("Скачиваю обновление %s…", u.version)
 
         def progress(x):
-            self.after(0, lambda: self.update_lbl.configure(text=f"Скачиваю версию {u.version}… {int(x * 100)}%"))
+            self.call_soon(lambda: self.update_lbl.configure(text=f"Скачиваю версию {u.version}… {int(x * 100)}%"))
 
         def work():
             try:
@@ -637,13 +644,37 @@ class App(ctk.CTk):
                 self.update_lbl.configure(text=f"Не удалось скачать обновление: {err}")
                 self.update_btn.configure(state="normal", text="Повторить")
                 return
-            run = any(e.status != "stopped" for e in self.engines.values())
+            running = [pid for pid, e in self.engines.items() if e.status != "stopped"]
             tray = self.state() == "withdrawn"
             log.info("Устанавливаю версию %s — программа перезапустится", u.version)
+            self.conf["resume_profiles"] = running
+            self.save()
             self.shutdown()
-            updater.install(setup, run=run, tray=tray)
+            try:
+                updater.install(setup, run=bool(running), tray=tray)
+            except Exception as e:   # антивирус удалил файл и т. п. — возвращаем всё, как было
+                log.error("Не удалось запустить установщик обновления: %s", e)
+                self.conf.pop("resume_profiles", None)
+                self.save()
+                self.restore_after_failed_update(running)
+                self.update_lbl.configure(text=f"Не удалось установить обновление: {e}")
+                return
             self.destroy()
         self.in_thread(work, done)
+
+    def restore_after_failed_update(self, running: list[str]):
+        self.updating = False
+        try:
+            self.tray = Tray(self)
+        except Exception as e:
+            self.tray = None
+            log.warning("Значок в трее недоступен: %s", e)
+        for pid in running:
+            if pid in self.engines:
+                self.engines[pid].start()
+        self.show_update_bar()
+        self.update_btn.configure(state="normal", text="Повторить")
+        self.render_status()
 
     def shutdown(self):
         """Останавливает все аккаунты и убирает значок — перед выходом и перед обновлением."""
@@ -666,28 +697,35 @@ class App(ctk.CTk):
                     conn.settimeout(2)
                     if conn.recv(64) == INSTANCE_HELLO:
                         conn.sendall(INSTANCE_REPLY)
-                        self.after(0, self.show_window)
+                        self.call_soon(self.show_window)
             except OSError:
-                continue
+                if srv.fileno() < 0:   # сокет закрыт — слушать больше нечего
+                    return
+                time.sleep(1)          # временная ошибка — не крутим цикл вхолостую
 
-    def auto_run(self):
-        """Запуск после входа в Windows: без окон с вопросами — проблемы пишем в журнал."""
-        started, skipped = [], []
-        for p in self.conf["profiles"]:
-            e = self.engines[p["id"]]
-            if not p["enabled"] or e.status != "stopped":
-                continue
-            problems = core.validate(p)
-            if problems:
-                skipped.append(p["name"])
-                log.warning("Автозапуск: «%s» не запущен — %s", p["name"], "; ".join(problems))
-                continue
-            e.start()
-            started.append(p["name"])
-        if started:
-            log.info("Автозапуск: работаю — %s", ", ".join(started))
-        if skipped and self.tray:
-            self.tray.notify(f"Не запущены: {', '.join(skipped)} — подробности во вкладке «Журнал»")
+    def auto_run(self, only: set[str] | None = None):
+        """Запуск без участия человека (вход в Windows, после обновления): без окон с вопросами —
+        проблемы пишем в журнал. only — запустить только эти профили, иначе все с «Запускать со всеми»."""
+        targets = [p for p in self.conf["profiles"]
+                   if (p["id"] in only if only else p["enabled"]) and self.engines[p["id"]].status == "stopped"]
+
+        def done(results):
+            started, skipped = [], []
+            for p, problems in results:
+                e = self.engines.get(p["id"])
+                if not e or e.status != "stopped":
+                    continue
+                if problems:
+                    skipped.append(p["name"])
+                    log.warning("Автозапуск: «%s» не запущен — %s", p["name"], "; ".join(problems))
+                    continue
+                e.start()
+                started.append(p["name"])
+            if started:
+                log.info("Автозапуск: работаю — %s", ", ".join(started))
+            if skipped and self.tray:
+                self.tray.notify(f"Не запущены: {', '.join(skipped)} — подробности во вкладке «Журнал»")
+        self.validate_async(targets, done)
 
     # ------------------------------------------------------------------ профили
 
@@ -743,7 +781,7 @@ class App(ctk.CTk):
         if multi:
             active = e.status != "stopped"
             self.profile_run_btn.configure(
-                text="■  Остановить этот" if active else "▶  Запустить только этот",
+                state="normal", text="■  Остановить этот" if active else "▶  Запустить только этот",
                 fg_color=RED if active else GREEN, hover_color="#b94541" if active else GREEN_HOVER)
             self.enabled_sw.select() if self.cfg["enabled"] else self.enabled_sw.deselect()
             self.profile_run_btn.pack(side="left", padx=(0, 8), after=self.profile_state)
@@ -827,10 +865,7 @@ class App(ctk.CTk):
         if not messagebox.askyesno("Удалить профиль", f"Удалить профиль «{p['name']}»?"
                                    + (f"\n\nВ очереди от этого аккаунта: {waiting} — они пропадут." if waiting else "")):
             return
-        try:
-            e._submit(e._stop()).result(timeout=5)
-        except Exception:
-            pass
+        e.close()
         session = BASE / f"{p['session_name']}.session"
         if session.exists() and messagebox.askyesno("Файл сессии", (
                 f"Удалить и файл сессии {session.name}?\n\n"
@@ -860,12 +895,22 @@ class App(ctk.CTk):
             return
         if not self.prepare_start():
             return
-        problems = core.validate(self.cfg)
-        if problems:
-            messagebox.showwarning("Не всё настроено", "Перед запуском:\n\n• " + "\n• ".join(problems))
-            self.show_problem_tab(problems)
-            return
-        e.start()
+        self.profile_run_btn.configure(state="disabled", text="Проверяю…")
+
+        def done(results):
+            self.render_profile_bar()
+            p, problems = results[0]
+            if p["id"] not in self.engines:   # профиль удалили, пока шла проверка
+                return
+            if problems:
+                if p["id"] != self.conf["current"]:
+                    self.switch_profile(p["id"])
+                messagebox.showwarning("Не всё настроено", "Перед запуском:\n\n• " + "\n• ".join(problems))
+                self.show_problem_tab(problems)
+                return
+            if self.engines[p["id"]].status == "stopped":
+                self.engines[p["id"]].start()
+        self.validate_async([self.cfg], done)
 
     def next_login(self):
         """Окно входа одно — аккаунты, которым нужен вход, проходят его по очереди."""
@@ -947,7 +992,7 @@ class App(ctk.CTk):
         self.status_lbl.configure(text=text)
         active = st != "stopped"
         self.start_btn.configure(
-            text="■  Остановить" if active else "▶  Запустить",
+            state="normal", text="■  Остановить" if active else "▶  Запустить",
             fg_color=RED if active else GREEN,
             hover_color="#b94541" if active else GREEN_HOVER)
         here = "normal" if self.engine.status == "running" else "disabled"
@@ -972,6 +1017,16 @@ class App(ctk.CTk):
             self.save_prompt()
         return True
 
+    def show_welcome(self):
+        self.tabs.set("Настройки")
+        self.welcome.pack(fill="x", padx=4, pady=(0, 10), before=self.settings_first)
+
+    def validate_async(self, profiles: list[dict], done):
+        """core.validate в фоне: он запускает CLI нейросетей (до десятков секунд), окно не должно висеть.
+        done([(профиль, проблемы), …]) вызывается потом в окне."""
+        snaps = [dict(p) for p in profiles]   # поток работает с копиями — окно может их менять
+        self.in_thread(lambda: [(p, core.validate(sn)) for p, sn in zip(profiles, snaps)], done)
+
     def show_problem_tab(self, problems):
         self.tabs.set("Промпт" if any("Промпт" in p for p in problems) and len(problems) == 1
                       else "Настройки")
@@ -990,18 +1045,24 @@ class App(ctk.CTk):
             messagebox.showwarning("Запуск", "Ни у одного аккаунта не включено «Запускать со всеми»")
             return
         multi = len(self.conf["profiles"]) > 1
-        for p in targets:
-            problems = core.validate(p)
-            if problems:
-                if p["id"] != self.conf["current"]:
-                    self.switch_profile(p["id"])
-                where = f" аккаунта «{p['name']}»" if multi else ""
-                messagebox.showwarning("Не всё настроено",
-                                       f"Перед запуском{where}:\n\n• " + "\n• ".join(problems))
-                self.show_problem_tab(problems)
-                return
-        for p in targets:
-            self.engines[p["id"]].start()
+        self.start_btn.configure(state="disabled", text="Проверяю…")
+
+        def done(results):
+            self.render_status()
+            for p, problems in results:
+                if problems and p["id"] in self.engines:
+                    if p["id"] != self.conf["current"]:
+                        self.switch_profile(p["id"])
+                    where = f" аккаунта «{p['name']}»" if multi else ""
+                    messagebox.showwarning("Не всё настроено",
+                                           f"Перед запуском{where}:\n\n• " + "\n• ".join(problems))
+                    self.show_problem_tab(problems)
+                    return
+            for p, _ in results:
+                e = self.engines.get(p["id"])
+                if e and e.status == "stopped":
+                    e.start()
+        self.validate_async(targets, done)
 
     def on_mode(self, value):
         self.cfg["confirm_before_post"] = value == MODE_CONFIRM
@@ -1578,9 +1639,12 @@ class App(ctk.CTk):
 
     def in_thread(self, work, done):
         """work() в фоне, done(result) — потом в окне."""
-        import threading
-        threading.Thread(target=lambda: (r := work(), self.after(0, lambda: done(r))),
-                         daemon=True).start()
+        threading.Thread(target=lambda: (r := work(), self.call_soon(lambda: done(r))), daemon=True).start()
+
+    def call_soon(self, fn):
+        """Выполнить fn в потоке окна. Можно звать из любого потока: tkinter из чужих потоков
+        вызывать нельзя (до запуска mainloop это падает), поэтому кладём в очередь — её разбирает poll()."""
+        self.ui_q.put(fn)
 
     # --- выбор способа подключения к нейросети ---
 
@@ -1841,6 +1905,8 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------ события
 
     def poll(self):
+        while not self.ui_q.empty():
+            self.ui_q.get_nowait()()
         while not self.log_q.empty():
             self.add_log(self.log_q.get_nowait())
         for e in list(self.engines.values()):
@@ -1919,6 +1985,11 @@ class App(ctk.CTk):
         waiting = len(self.all_pending())
         if waiting and not messagebox.askyesno(
                 "Выход", f"В очереди {waiting} непроверенных комментариев. Выйти?"):
+            return
+        busy = sum(e.busy_auto() for e in self.engines.values())
+        if busy and not messagebox.askyesno(
+                "Выход", f"Ещё пишутся или ждут паузы перед публикацией комментариев: {busy}. "
+                         "После выхода они не будут опубликованы. Выйти?"):
             return
         if self.prompt_dirty() and messagebox.askyesno("Промпт", "Сохранить изменения в промпте?"):
             self.save_prompt()
