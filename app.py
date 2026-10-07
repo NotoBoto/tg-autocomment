@@ -86,6 +86,23 @@ def open_path(p: Path):
     os.startfile(str(p))  # Windows
 
 
+HOTKEY_ACTIONS = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}   # V, C, X, A
+
+
+def hotkey_any_layout(e):
+    """Ctrl+V/C/X/A в любой раскладке. tkinter узнаёт сочетание по букве (keysym), а в русской раскладке
+    на той же клавише «м», «с», «ч», «ф» — и вставка молча не срабатывает. Смотрим на физическую
+    клавишу (keycode — код клавиши Windows) и вызываем нужное действие сами."""
+    action = HOTKEY_ACTIONS.get(e.keycode)
+    if action and e.keysym.lower() not in ("v", "c", "x", "a"):   # латиница — tkinter справится сам
+        e.widget.event_generate(action)
+        return "break"
+
+
+def fix_hotkeys_any_layout(root):
+    root.bind_all("<Control-KeyPress>", hotkey_any_layout, add="+")
+
+
 def repaint_after_scroll(sf: ctk.CTkScrollableFrame):
     """customtkinter на Windows при прокрутке иногда оставляет «огрызки» виджетов (зависит от масштаба
     экрана и видеокарты): виджеты переезжают, а освободившееся место не перерисовывается.
@@ -546,6 +563,7 @@ class App(ctk.CTk):
         self._build_log_tab(self.tabs.add("Журнал"))
         for sf in (self.settings_sf, self.list_frame):
             repaint_after_scroll(sf)
+        fix_hotkeys_any_layout(self)
         self.statusbar = ctk.CTkLabel(self, text="", anchor="w", text_color="gray")
         self.statusbar.pack(fill="x", padx=16, pady=(0, 6))
 
