@@ -22,7 +22,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -57,7 +57,7 @@ DEFAULTS = {
     "proxy_mode": "system",        # прокси для Telegram: system (из VPN/Windows) | custom | none
     "proxy": "",                   # для custom: socks5://…, http://… или ссылка MTProxy
     "channels": [],                # каналы, за которыми следим
-    "backend": "claude_code",      # claude_code | api (Anthropic) | gemini_cli (Antigravity) | gemini_api | codex | openai_api
+    "backend": "claude_code",      # claude_code | api (Anthropic) | gemini_cli (Antigravity) | gemini_api | codex | openai_api | openai_compat
     "model": "sonnet",
     "api_key": "",
     "api_model": "claude-opus-5-5",
@@ -67,6 +67,9 @@ DEFAULTS = {
     "codex_model": "",             # модель Codex; пусто — по умолчанию для аккаунта
     "openai_api_key": "",
     "openai_api_model": "gpt-5.5",
+    "compat_base_url": "http://localhost:1234/v1",   # своя модель: OpenAI-совместимый сервер (LM Studio…)
+    "compat_api_key": "",          # большинству локальных серверов не нужен
+    "compat_model": "",
     "prompt_file": "prompt.txt",
     "images_dir": "images",
     "attach_image_chance": 1.0,
@@ -265,6 +268,12 @@ def validate(cfg) -> list[str]:
         if not openai_key(cfg):
             problems.append("Не указан API-ключ OpenAI — «Настройки» → «Нейросеть»")
         return problems
+    if backend == "openai_compat":
+        if not str(cfg.get("compat_base_url", "")).strip():
+            problems.append("Не указан адрес сервера своей модели — «Настройки» → «Нейросеть»")
+        if not str(cfg.get("compat_model", "")).strip():
+            problems.append("Не выбрана модель — «Настройки» → «Нейросеть» → «Проверить подключение»")
+        return problems
     if backend == "codex":
         st = codex_status()
         if not st["installed"]:
@@ -397,7 +406,8 @@ def set_autostart(on: bool):
 
 
 BACKEND_NAMES = {"claude_code": "Claude Code", "api": "Claude API", "gemini_cli": "Antigravity",
-                 "gemini_api": "Gemini API", "codex": "Codex", "openai_api": "OpenAI API"}
+                 "gemini_api": "Gemini API", "codex": "Codex", "openai_api": "OpenAI API",
+                 "openai_compat": "Своя модель"}
 
 # Так сервисы отвечают на запрос из страны, где они не работают
 REGION_MARKERS = ("not currently available in your location", "location is not supported",
@@ -628,6 +638,76 @@ def check_openai_key(cfg) -> tuple[bool, str, list[str]]:
     if model not in models:
         return True, f"Ключ работает ✓, но модели {model} нет — выберите из списка", models
     return True, f"Ключ работает ✓  доступно моделей: {len(models)}", models
+
+
+# ---------- своя модель: любой OpenAI-совместимый сервер ----------
+# LM Studio, Ollama, llama.cpp, vLLM — локально; OpenRouter, DeepSeek и т. п. — в облаке.
+# Запросы — классическим chat/completions: его понимают все такие серверы.
+
+COMPAT_PRESETS = {"LM Studio": "http://localhost:1234/v1", "Ollama": "http://localhost:11434/v1"}
+
+
+def is_local_url(url: str) -> bool:
+    """Сервер на этом компьютере или в домашней сети — к нему ходим мимо системного прокси (VPN)."""
+    import ipaddress
+    from urllib.parse import urlsplit
+    host = (urlsplit(url).hostname or "").lower()
+    if host in ("localhost", "") or host.endswith((".local", ".lan")):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local
+
+
+def compat_client(cfg, asynchronous=False):
+    import httpx
+    import openai
+    url = str(cfg.get("compat_base_url", "")).strip().rstrip("/")
+    key = str(cfg.get("compat_api_key", "")).strip() or "not-needed"   # локальным серверам ключ не нужен
+    local = is_local_url(url)
+    if asynchronous:
+        http = httpx.AsyncClient(trust_env=False) if local else None
+        return openai.AsyncOpenAI(base_url=url, api_key=key, http_client=http, max_retries=1)
+    http = httpx.Client(trust_env=False) if local else None
+    return openai.OpenAI(base_url=url, api_key=key, http_client=http, timeout=20, max_retries=0)
+
+
+def compat_connection_hint(url: str) -> str:
+    if is_local_url(url):
+        return (f"Нет связи с {url} — запущен ли сервер? LM Studio: вкладка Developer → Start Server; "
+                "Ollama: программа должна быть запущена")
+    return f"Нет связи с {url} — проверьте адрес и интернет (или VPN)"
+
+
+def check_compat(cfg) -> tuple[bool, str, list[str]]:
+    """Проверка подключения без генерации: запрашиваем список моделей сервера."""
+    import openai
+    url = str(cfg.get("compat_base_url", "")).strip()
+    if not url:
+        return False, "Адрес сервера не указан", []
+    try:
+        models = sorted(m.id for m in compat_client(cfg).models.list())
+    except openai.APIConnectionError:
+        return False, compat_connection_hint(url), []
+    except openai.AuthenticationError:
+        return False, "Сервер требует API-ключ (или ключ не подходит)", []
+    except openai.NotFoundError:
+        return False, "По этому адресу нет OpenAI-совместимого API — адрес обычно оканчивается на /v1", []
+    except openai.APIStatusError as e:
+        return False, f"Ошибка сервера ({e.status_code}): {e.message}", []
+    except Exception as e:
+        return False, f"Не удалось подключиться: {e}", []
+    if not models:
+        return True, "Сервер работает ✓, но моделей нет — загрузите модель (в LM Studio — «Load model»)", []
+    model = str(cfg.get("compat_model", "")).strip()
+    if model and model not in models:
+        return True, f"Сервер работает ✓, но модели {model} нет — выберите из списка", models
+    return True, f"Сервер работает ✓  моделей: {len(models)}", models
+
+
+THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)   # «размышления» DeepSeek-R1, Qwen3 и т. п.
 
 
 # ---------- пост, ожидающий решения ----------
@@ -1027,7 +1107,8 @@ class Engine:
                 user_msg += f"\n\nПОЖЕЛАНИЯ: {wish.strip()}"
             gen = {"api": self._gen_api, "gemini_cli": self._gen_gemini_cli,
                    "gemini_api": self._gen_gemini_api, "codex": self._gen_codex,
-                   "openai_api": self._gen_openai_api}.get(self.cfg.get("backend"), self._gen_claude_code)
+                   "openai_api": self._gen_openai_api,
+                   "openai_compat": self._gen_compat}.get(self.cfg.get("backend"), self._gen_claude_code)
             text = await gen(system, user_msg, images)
             if not text or text.upper().startswith("SKIP"):
                 return None
@@ -1212,6 +1293,49 @@ class Engine:
             lines = [l for l in msg.splitlines() if "error" in l.lower()]
             raise RuntimeError("Codex: " + (lines[-1] if lines else msg[-400:] or f"код выхода {proc.returncode}"))
         return text
+
+    async def _gen_compat(self, system: str, user_msg: str, images: list[Path]) -> str:
+        """Своя модель на OpenAI-совместимом сервере (LM Studio, Ollama…) через chat/completions."""
+        import openai
+        cfg = self.cfg
+        url = str(cfg.get("compat_base_url", "")).strip().rstrip("/")
+        sig = (url, cfg.get("compat_api_key", ""))
+        if getattr(self, "_compat_sig", None) != sig:
+            self._compat_client, self._compat_sig = compat_client(cfg, asynchronous=True), sig
+        content: str | list = user_msg
+        if images:   # картинки понимают только модели с vision; без них сервер вернёт ошибку
+            content = [{"type": "text", "text": user_msg + "\n\nК посту приложены картинки — учти, что на них. "
+                                                           "Выведи только сам комментарий."}]
+            for img in images:
+                mime = mimetypes.guess_type(img.name)[0] or "image/jpeg"
+                content.append({"type": "image_url", "image_url": {
+                    "url": f"data:{mime};base64,{base64.b64encode(img.read_bytes()).decode()}"}})
+        model = str(cfg.get("compat_model", "")).strip()
+        try:
+            resp = await self._compat_client.with_options(
+                timeout=float(cfg.get("claude_timeout_sec", 120))).chat.completions.create(
+                model=model, messages=[{"role": "system", "content": system},
+                                       {"role": "user", "content": content}])
+        except openai.APIConnectionError:
+            raise RuntimeError(compat_connection_hint(url))
+        except openai.APITimeoutError:
+            raise RuntimeError("Модель не ответила вовремя — увеличьте «Таймаут ответа» или возьмите модель поменьше")
+        except openai.AuthenticationError:
+            raise RuntimeError("Сервер требует API-ключ (или ключ не подходит)")
+        except openai.NotFoundError:
+            raise RuntimeError(f"Модель {model} не найдена или не загружена — «Проверить подключение» в «Настройках»")
+        except openai.APIStatusError as e:
+            low = str(e.message).lower()
+            if "context" in low and any(w in low for w in ("length", "window", "overflow", "exceed", "too long")):
+                raise RuntimeError("Промпт не помещается в контекст модели — увеличьте длину контекста "
+                                   "(LM Studio: настройки модели → Context Length, нужно 16–32 тыс. токенов и больше) "
+                                   "или сократите промпт")
+            raise RuntimeError(f"Ошибка сервера ({e.status_code}): {e.message}")
+        u = resp.usage
+        if u:
+            self.log.info("Своя модель %s: вход %s ток., выход %s ток.", model, u.prompt_tokens, u.completion_tokens)
+        text = (resp.choices[0].message.content or "") if resp.choices else ""
+        return THINK_RE.sub("", text).strip()
 
     async def _gen_openai_api(self, system: str, user_msg: str, images: list[Path]) -> str:
         import openai

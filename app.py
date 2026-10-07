@@ -35,7 +35,8 @@ BTN_HOVER = ctk.ThemeManager.theme["CTkButton"]["hover_color"]
 LABEL_W = 270  # ширина колонки подписей в блоке «Нейросеть»
 BACKENDS = {"Claude Code": "claude_code", "Claude API": "api",
             "Antigravity (Google)": "gemini_cli", "Gemini API": "gemini_api",
-            "ChatGPT (Codex)": "codex", "OpenAI API": "openai_api"}
+            "ChatGPT (Codex)": "codex", "OpenAI API": "openai_api",
+            "Своя модель": "openai_compat"}
 DEFAULT_MODEL = "(по умолчанию)"
 PROXY_MODES = {"Системный (из VPN)": "system", "Свой": "custom", "Без прокси": "none"}
 MODE_CONFIRM, MODE_AUTO = "Подтверждать вручную", "Публиковать сами"
@@ -1264,7 +1265,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(self.welcome, justify="left", anchor="w", wraplength=900, text=(
             "👋  Добро пожаловать! Для начала работы:\n"
             "0. В блоке «Нейросеть» выберите способ: Claude Code, Antigravity или ChatGPT (вход в аккаунт, "
-            "кнопка «Установить и войти») либо API-ключ Claude/Gemini/OpenAI\n"
+            "кнопка «Установить и войти»), API-ключ Claude/Gemini/OpenAI или свою модель (LM Studio, Ollama)\n"
             "1. Получите API ID и API Hash на my.telegram.org (раздел «API development tools»)\n"
             "2. Укажите канал, под постами которого нужно комментировать\n"
             "3. Заполните вкладку «Промпт» — инструкцию для нейросети\n"
@@ -1418,8 +1419,39 @@ class App(ctk.CTk):
                  core.check_openai_key)
         model_row(oa, 3, self.openai_api_model, "список моделей подгрузится после «Проверить ключ»")
 
+        # --- своя модель: любой OpenAI-совместимый сервер ---
+        lm = sub("Своя нейросеть на OpenAI-совместимом сервере: локально — LM Studio, Ollama, llama.cpp, vLLM "
+                 "(бесплатно, без интернета и VPN), или облачные OpenRouter, DeepSeek и т. п. Наш промпт "
+                 "большой — у модели должен быть контекст от 16–32 тыс. токенов; картинки поста понимают "
+                 "только модели с vision.")
+        ctk.CTkLabel(lm, text="Адрес сервера").grid(row=1, column=0, sticky="w", padx=14, pady=5)
+        url_e = ctk.CTkEntry(lm, placeholder_text="http://localhost:1234/v1")
+        url_e.grid(row=1, column=1, sticky="ew", padx=4)
+        self.fields["compat_base_url"] = url_e
+        presets = ctk.CTkFrame(lm, fg_color="transparent")
+        presets.grid(row=1, column=2, sticky="w", padx=6)
+
+        def preset(u):
+            url_e.delete(0, "end")
+            url_e.insert(0, u)
+        for name, u in core.COMPAT_PRESETS.items():
+            ctk.CTkButton(presets, text=name, width=90, fg_color=GRAY, hover_color=GRAY_HOVER,
+                          command=lambda u=u: preset(u)).pack(side="left", padx=2)
+        ctk.CTkLabel(lm, text="API-ключ").grid(row=2, column=0, sticky="w", padx=14, pady=5)
+        key_e = ctk.CTkEntry(lm, show="•", placeholder_text="необязательно — локальным серверам не нужен")
+        key_e.grid(row=2, column=1, sticky="ew", padx=4)
+        self.fields["compat_api_key"] = key_e
+        self.compat_model = ctk.CTkComboBox(lm, values=[""], width=260)
+        model_row(lm, 3, self.compat_model, "список подгрузится после «Проверить подключение»")
+        chk = ctk.CTkFrame(lm, fg_color="transparent")
+        chk.grid(row=4, column=1, columnspan=2, sticky="w", padx=4, pady=(2, 4))
+        self.compat_btn = ctk.CTkButton(chk, text="Проверить подключение", width=180, command=self.check_compat)
+        self.compat_btn.pack(side="left")
+        self.compat_lbl = ctk.CTkLabel(chk, text="", text_color="gray")
+        self.compat_lbl.pack(side="left", padx=10)
+
         self.backend_frames = {"claude_code": cc, "api": api, "gemini_cli": gc, "gemini_api": ga,
-                               "codex": cx, "openai_api": oa}
+                               "codex": cx, "openai_api": oa, "openai_compat": lm}
 
         field(ai, 4, "max_post_images", "Сколько картинок поста показывать", "если включено «смотрит картинки»", width=80)
         field(ai, 5, "claude_timeout_sec", "Таймаут ответа, сек", width=80)
@@ -1518,6 +1550,23 @@ class App(ctk.CTk):
 
     # --- выбор способа подключения к нейросети ---
 
+    def check_compat(self):
+        cfg = dict(self.cfg, compat_base_url=self.fields["compat_base_url"].get().strip(),
+                   compat_api_key=self.fields["compat_api_key"].get().strip(),
+                   compat_model=self.compat_model.get().strip())
+        self.compat_btn.configure(state="disabled")
+        self.compat_lbl.configure(text="Проверяю…", text_color="gray")
+
+        def done(res):
+            ok, msg, models = res
+            self.compat_btn.configure(state="normal")
+            self.compat_lbl.configure(text=msg, text_color=GREEN if ok else RED)
+            if models:
+                self.compat_model.configure(values=models)
+                if self.compat_model.get().strip() not in models:
+                    self.compat_model.set(models[0])
+        self.in_thread(lambda: core.check_compat(cfg), done)
+
     def on_tray_switch(self):
         self.conf["close_to_tray"] = bool(self.tray_sw.get())
         self.save()
@@ -1586,6 +1635,7 @@ class App(ctk.CTk):
         self.gemini_api_model.set(c.get("gemini_api_model") or core.GEMINI_API_DEFAULT)
         self.codex_model.set(c.get("codex_model") or DEFAULT_MODEL)
         self.openai_api_model.set(c.get("openai_api_model") or core.OPENAI_API_DEFAULT)
+        self.compat_model.set(c.get("compat_model") or "")
         self.backend.set(next(k for k, v in BACKENDS.items() if v == c.get("backend", "claude_code")))
         self.show_backend()
         self.update_price()
@@ -1653,6 +1703,9 @@ class App(ctk.CTk):
         cm = self.codex_model.get().strip()
         new["codex_model"] = "" if cm in ("", DEFAULT_MODEL) else cm
         new["openai_api_model"] = self.openai_api_model.get().strip() or core.OPENAI_API_DEFAULT
+        new["compat_base_url"] = f["compat_base_url"]
+        new["compat_api_key"] = f["compat_api_key"]
+        new["compat_model"] = self.compat_model.get().strip()
         new["attach_image_chance"] = round(self.chance.get() / 100, 2)
         new["skip_keywords"] = [w.strip() for w in self.keywords.get("1.0", "end").splitlines() if w.strip()]
 
