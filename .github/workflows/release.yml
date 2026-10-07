@@ -11,6 +11,9 @@ on:
 permissions:
   contents: write
 
+env:
+  PYTHONUTF8: "1"   # русский текст в выводе сборки
+
 jobs:
   build:
     runs-on: windows-latest
