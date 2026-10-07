@@ -25,7 +25,8 @@
     (Gemini CLI с 18.06.2026 не работает с личными аккаунтами — Antigravity его замена)
   - **Claude API** — ключ Anthropic, оплата по токенам; большой промпт кэшируется
   - **Gemini API** — ключ Google AI Studio, есть бесплатный лимит
-  - **ChatGPT (Codex)** — по подписке ChatGPT Plus/Pro/Business через Codex CLI, ключ не нужен
+  - **ChatGPT (Codex)** — через Codex CLI и аккаунт ChatGPT с любым тарифом, включая бесплатный
+    (лимиты зависят от тарифа: на Free и Go маленькие, для постоянной работы лучше Plus и выше), ключ не нужен
   - **OpenAI API** — ключ platform.openai.com, оплата по токенам
 
   Для Claude Code, Antigravity и Codex программа сама устанавливает нужное и открывает вход

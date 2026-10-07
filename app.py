@@ -1394,8 +1394,9 @@ class App(ctk.CTk):
         model_row(ga, 3, self.gemini_api_model, "список моделей подгрузится после «Проверить ключ»")
 
         # --- ChatGPT через Codex CLI по подписке ---
-        cx = sub("Работает через Codex CLI — программу OpenAI — и вашу подписку ChatGPT (Plus, Pro, "
-                 "Business); ключ не нужен. Расходует лимиты Codex из подписки.")
+        cx = sub("Работает через Codex CLI — программу OpenAI — и ваш аккаунт ChatGPT с любым тарифом, "
+                 "включая бесплатный; ключ не нужен. Расходует лимиты Codex из тарифа: на Free и Go они "
+                 "маленькие, для постоянной работы лучше Plus и выше.")
         self.codex_model = ctk.CTkComboBox(cx, values=[DEFAULT_MODEL], width=260)
         model_row(cx, 1, self.codex_model, "список моделей появится после входа")
         self.codex_block = CliBlock(self, cx, row=2, name="Codex CLI", account="ChatGPT",
