@@ -1,6 +1,7 @@
 """
 Окно автокомментатора. Запуск: start.bat или python app.py
 """
+import ctypes
 import logging
 import os
 import queue
@@ -83,6 +84,28 @@ def thumbnail(path: Path | None, box: int) -> ctk.CTkImage | None:
 
 def open_path(p: Path):
     os.startfile(str(p))  # Windows
+
+
+def repaint_after_scroll(sf: ctk.CTkScrollableFrame):
+    """customtkinter на Windows при прокрутке иногда оставляет «огрызки» виджетов (зависит от масштаба
+    экрана и видеокарты): виджеты переезжают, а освободившееся место не перерисовывается.
+    Через миг после любого сдвига (колесо, ползунок, клавиши) просим Windows перерисовать всю область."""
+    if sys.platform != "win32":
+        return
+    canvas = sf._parent_canvas
+    pending = {"id": None}
+    flags = 0x0001 | 0x0004 | 0x0080 | 0x0100   # RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
+
+    def redraw():
+        pending["id"] = None
+        ctypes.windll.user32.RedrawWindow(canvas.winfo_id(), None, None, flags)
+
+    def on_scroll(*args):
+        sf._scrollbar.set(*args)   # как было у customtkinter
+        if pending["id"]:
+            canvas.after_cancel(pending["id"])
+        pending["id"] = canvas.after(40, redraw)
+    canvas.configure(yscrollcommand=on_scroll)
 
 
 # Две копии программы мешали бы друг другу (одни и те же сессии Telegram, двойные комментарии).
@@ -521,6 +544,8 @@ class App(ctk.CTk):
         self._build_settings_tab(self.tabs.add("Настройки"))
         self._build_prompt_tab(self.tabs.add("Промпт"))
         self._build_log_tab(self.tabs.add("Журнал"))
+        for sf in (self.settings_sf, self.list_frame):
+            repaint_after_scroll(sf)
         self.statusbar = ctk.CTkLabel(self, text="", anchor="w", text_color="gray")
         self.statusbar.pack(fill="x", padx=16, pady=(0, 6))
 
@@ -1355,7 +1380,7 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------ настройки
 
     def _build_settings_tab(self, tab):
-        sf = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        sf = self.settings_sf = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         sf.pack(fill="both", expand=True)
         self.fields: dict[str, ctk.CTkEntry] = {}
 
