@@ -17,7 +17,7 @@ if not exist "%PY%" (
 )
 
 :deps
-"%PY%" -c "import telethon, python_socks, qrcode, customtkinter, PIL, anthropic, google.genai, openai" 2>nul || (
+"%PY%" -c "import telethon, python_socks, qrcode, customtkinter, pystray, PIL, anthropic, google.genai, openai" 2>nul || (
   echo Первый запуск: устанавливаю библиотеки...
   "%PY%" -m pip install -r requirements.txt || (pause & exit /b 1)
 )

@@ -5,7 +5,11 @@ import logging
 import os
 import queue
 import shutil
+import socket
+import sys
+import threading
 import webbrowser
+import zlib
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -76,6 +80,81 @@ def thumbnail(path: Path | None, box: int) -> ctk.CTkImage | None:
 
 def open_path(p: Path):
     os.startfile(str(p))  # Windows
+
+
+# Две копии программы мешали бы друг другу (одни и те же сессии Telegram, двойные комментарии).
+# Первая копия слушает локальный порт; вторая просит её показать окно и выходит.
+INSTANCE_HELLO, INSTANCE_REPLY = b"tg-autocomment:show", b"tg-autocomment:ok"
+INSTANCE_PORT = 20000 + zlib.crc32(str(BASE).encode()) % 20000   # своя у каждой папки с программой
+
+
+def single_instance() -> socket.socket | None | bool:
+    """Сокет первой копии; False — программа уже запущена (окно ей показано); None — проверка невозможна."""
+    try:
+        with socket.create_connection(("127.0.0.1", INSTANCE_PORT), timeout=1) as c:
+            c.sendall(INSTANCE_HELLO)
+            if c.recv(64) == INSTANCE_REPLY:
+                return False
+    except OSError:
+        pass
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        srv.bind(("127.0.0.1", INSTANCE_PORT))
+        srv.listen()
+        return srv
+    except OSError:   # порт занят чем-то другим — просто работаем без проверки
+        srv.close()
+        return None
+
+
+# ======================================================================
+#  Значок в трее
+# ======================================================================
+
+def tray_image(color: str) -> Image.Image:
+    """Облачко комментария на круге цвета статуса."""
+    from PIL import ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((0, 0, 63, 63), fill=color)
+    d.rounded_rectangle((14, 17, 50, 41), radius=7, fill="white")
+    d.polygon([(20, 40), (20, 50), (30, 40)], fill="white")
+    return img
+
+
+class Tray:
+    """Значок в трее: окно можно закрыть, а программа продолжит работать.
+    Меню pystray работает в своём потоке — действия передаём в окно через app.after."""
+
+    def __init__(self, app: "App"):
+        import pystray
+        self.app = app
+        item = pystray.MenuItem
+        self.icon = pystray.Icon("tg_autocomment", tray_image(STATUS["stopped"][1]), "TG Автокомментатор",
+                                 pystray.Menu(
+                                     item("Открыть", lambda: app.after(0, app.show_window), default=True),
+                                     item(lambda i: "■  Остановить" if app.status != "stopped" else "▶  Запустить",
+                                          lambda: app.after(0, app.toggle_run)),
+                                     pystray.Menu.SEPARATOR,
+                                     item("Выход", lambda: app.after(0, app.quit_app))))
+        self.color = STATUS["stopped"][1]
+        self.icon.run_detached()
+
+    def update(self, status: str, tip: str):
+        color = STATUS[status][1]
+        if color != self.color:
+            self.icon.icon, self.color = tray_image(color), color
+        self.icon.title = tip[:127]   # у Windows ограничение длины подсказки
+        self.icon.update_menu()
+
+    def notify(self, text: str):
+        try:
+            self.icon.notify(text, "TG Автокомментатор")
+        except Exception:
+            pass
+
+    def stop(self):
+        self.icon.stop()
 
 
 # ======================================================================
@@ -395,8 +474,10 @@ class KeyBlock:
 # ======================================================================
 
 class App(ctk.CTk):
-    def __init__(self):
+    def __init__(self, autostart=False, instance: socket.socket | None = None):
         super().__init__()
+        if autostart:
+            self.withdraw()   # до первой отрисовки — окно не мелькнёт
         self.log_q = setup_logging()
         first_run = not core.CONFIG_FILE.exists()
         # Не self.config: это имя метода tkinter
@@ -425,12 +506,64 @@ class App(ctk.CTk):
         self.statusbar = ctk.CTkLabel(self, text="", anchor="w", text_color="gray")
         self.statusbar.pack(fill="x", padx=16, pady=(0, 6))
 
+        self.tray_hinted = False
+        try:
+            self.tray: Tray | None = Tray(self)
+        except Exception as e:   # нет pystray или трей недоступен — крестик просто закрывает программу
+            self.tray = None
+            log.warning("Значок в трее недоступен: %s", e)
+            self.tray_sw.configure(state="disabled")
         self.render_status()
         self.render_queue()
         if first_run or core.validate(self.cfg):
             self.tabs.set("Настройки")
             self.welcome.pack(fill="x", padx=4, pady=(0, 10), before=self.settings_first)
+        if instance:
+            threading.Thread(target=self.listen_instances, args=(instance,), daemon=True).start()
+        # Программу перенесли в другую папку или сменили Python — обновляем команду автозапуска
+        if core.get_autostart() not in (None, core.autostart_command()):
+            try:
+                core.set_autostart(True)
+            except OSError as e:
+                log.warning("Не удалось обновить автозапуск: %s", e)
+        if autostart:
+            if not self.tray:
+                self.deiconify()
+            log.info("Запуск вместе с Windows: начну работу через %d сек", core.AUTO_RUN_DELAY)
+            self.after(core.AUTO_RUN_DELAY * 1000, self.auto_run)
         self.after(100, self.poll)
+
+    def listen_instances(self, srv: socket.socket):
+        """Повторный запуск программы: показываем это окно вместо второй копии."""
+        while True:
+            try:
+                conn, _ = srv.accept()
+                with conn:
+                    conn.settimeout(2)
+                    if conn.recv(64) == INSTANCE_HELLO:
+                        conn.sendall(INSTANCE_REPLY)
+                        self.after(0, self.show_window)
+            except OSError:
+                continue
+
+    def auto_run(self):
+        """Запуск после входа в Windows: без окон с вопросами — проблемы пишем в журнал."""
+        started, skipped = [], []
+        for p in self.conf["profiles"]:
+            e = self.engines[p["id"]]
+            if not p["enabled"] or e.status != "stopped":
+                continue
+            problems = core.validate(p)
+            if problems:
+                skipped.append(p["name"])
+                log.warning("Автозапуск: «%s» не запущен — %s", p["name"], "; ".join(problems))
+                continue
+            e.start()
+            started.append(p["name"])
+        if started:
+            log.info("Автозапуск: работаю — %s", ", ".join(started))
+        if skipped and self.tray:
+            self.tray.notify(f"Не запущены: {', '.join(skipped)} — подробности во вкладке «Журнал»")
 
     # ------------------------------------------------------------------ профили
 
@@ -684,6 +817,14 @@ class App(ctk.CTk):
         self.latest_chan.configure(state=here)
         self.status = st
         self.render_profile_bar()
+        self.update_tray()
+
+    def update_tray(self):
+        if not getattr(self, "tray", None):
+            return
+        n = len(self.all_pending())
+        tip = f"TG Автокомментатор — {self.status_lbl.cget('text')}" + (f" · в очереди: {n}" if n else "")
+        self.tray.update(self.status, tip)
 
     def prepare_start(self) -> bool:
         if not self.apply_settings(silent=True):
@@ -868,6 +1009,7 @@ class App(ctk.CTk):
 
         n = len(pending)
         self.title(f"({n}) TG Автокомментатор" if n else "TG Автокомментатор")
+        self.update_tray()
 
         p = self.current()
         if not p:
@@ -1175,6 +1317,21 @@ class App(ctk.CTk):
         self.keywords = ctk.CTkTextbox(fl, height=150)
         self.keywords.grid(row=2, column=0, columnspan=3, sticky="ew", padx=14, pady=(6, 12))
 
+        wn = section("Окно", "Общее для всех аккаунтов")
+        self.tray_sw = ctk.CTkSwitch(wn, text="При закрытии окна сворачивать в трей — программа продолжает "
+                                              "работать, выход через значок в трее",
+                                     command=self.on_tray_switch)
+        if self.conf["close_to_tray"]:
+            self.tray_sw.select()
+        self.tray_sw.grid(row=2, column=0, columnspan=3, sticky="w", padx=14, pady=(6, 4))
+        self.autostart_sw = ctk.CTkSwitch(wn, text=f"Запускать вместе с Windows — сразу в трей, через "
+                                                   f"{core.AUTO_RUN_DELAY} сек начинать работу "
+                                                   "(аккаунты с «Запускать со всеми»)",
+                                          command=self.on_autostart_switch)
+        if core.get_autostart():
+            self.autostart_sw.select()
+        self.autostart_sw.grid(row=3, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 12))
+
         bottom = ctk.CTkFrame(tab, fg_color="transparent")
         bottom.pack(fill="x", pady=(6, 0))
         ctk.CTkButton(bottom, text="Сохранить настройки", height=38, width=220,
@@ -1206,6 +1363,20 @@ class App(ctk.CTk):
                          daemon=True).start()
 
     # --- выбор способа подключения к нейросети ---
+
+    def on_tray_switch(self):
+        self.conf["close_to_tray"] = bool(self.tray_sw.get())
+        self.save()
+
+    def on_autostart_switch(self):
+        on = bool(self.autostart_sw.get())
+        try:
+            core.set_autostart(on)
+        except OSError as e:
+            messagebox.showerror("Автозапуск", f"Не удалось изменить автозапуск Windows: {e}")
+            self.autostart_sw.toggle()
+            return
+        log.info("Автозапуск с Windows %s", "включён" if on else "выключен")
 
     def show_proxy(self):
         mode = PROXY_MODES.get(self.proxy_mode.get(), "system")
@@ -1444,6 +1615,10 @@ class App(ctk.CTk):
                     own_dialog.close()
             self.render_queue()
         elif kind == "login_needed":
+            if self.state() == "withdrawn":   # окно в трее — без него вход не пройти
+                self.show_window()
+                if self.tray:
+                    self.tray.notify(f"Аккаунту «{e.cfg['name']}» нужен вход в Telegram")
             self.login_waiting.append(e.cfg["id"])
             self.next_login()
         elif kind in ("qr", "code_sent", "password_needed", "login_error"):
@@ -1459,6 +1634,9 @@ class App(ctk.CTk):
             self.tabs.set("Очередь")
             self.render_queue()
             self.bell()
+            if self.tray and self.state() == "withdrawn":
+                who = f"«{e.cfg['name']}» · " if len(self.engines) > 1 else ""
+                self.tray.notify(f"{who}Новый пост {data.channel} ждёт подтверждения")
         elif kind == "pending_update":
             self.render_queue()
         elif kind == "pending_done":
@@ -1475,6 +1653,24 @@ class App(ctk.CTk):
             self.counter_lbl.configure(text=f"Опубликовано за сессию: {self.posted_count}")
 
     def on_close(self):
+        """Крестик: в трей (программа продолжает работать) или выход — по настройке."""
+        if self.tray and self.conf["close_to_tray"]:
+            self.save_draft()
+            self.withdraw()
+            if not self.tray_hinted:
+                self.tray_hinted = True
+                self.tray.notify("Программа продолжает работать в трее. Открыть — щелчок по значку, "
+                                 "выйти — правая кнопка → «Выход».")
+            return
+        self.quit_app()
+
+    def show_window(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def quit_app(self):
+        self.show_window()   # вопросы ниже должны быть видны, даже если окно было в трее
         waiting = len(self.all_pending())
         if waiting and not messagebox.askyesno(
                 "Выход", f"В очереди {waiting} непроверенных комментариев. Выйти?"):
@@ -1488,14 +1684,19 @@ class App(ctk.CTk):
             except Exception:
                 pass
         shutil.rmtree(core.MEDIA_DIR, ignore_errors=True)
+        if self.tray:
+            self.tray.stop()
         self.destroy()
 
 
 def run():
+    instance = single_instance()
+    if instance is False:   # уже запущена — она сама покажет окно
+        return
     ctk.set_appearance_mode("system")
     ctk.set_default_color_theme("blue")
     try:
-        App().mainloop()
+        App(autostart=core.AUTOSTART_ARG in sys.argv, instance=instance).mainloop()
     except Exception as e:
         logging.getLogger("autocomment").exception("Сбой")
         messagebox.showerror("TG Автокомментатор", f"Программа упала:\n{e}\n\nПодробности в log.txt")

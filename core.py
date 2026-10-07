@@ -15,6 +15,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,7 +76,7 @@ log = logging.getLogger("autocomment")
 
 
 # ---------- настройки ----------
-# config.json: {"profiles": [профиль, …], "current": id профиля, открытого в окне}.
+# config.json: {"profiles": [профиль, …], "current": id профиля, открытого в окне, "close_to_tray": bool}.
 # Профиль — один аккаунт Telegram со всеми своими настройками (ключи из DEFAULTS + "id").
 
 def load_config() -> dict:
@@ -91,7 +92,8 @@ def load_config() -> dict:
             LEGACY_DONE_FILE.rename(done_file({"id": "main"}))
     profiles = [normalize_profile(p) for p in data["profiles"]] or [normalize_profile({"id": "main"})]
     ids = [p["id"] for p in profiles]
-    return {"profiles": profiles, "current": data.get("current") if data.get("current") in ids else ids[0]}
+    return {"profiles": profiles, "current": data.get("current") if data.get("current") in ids else ids[0],
+            "close_to_tray": data.get("close_to_tray", True)}   # крестик прячет окно в трей
 
 
 def normalize_profile(p: dict) -> dict:
@@ -344,6 +346,42 @@ def cli_env(drop=()) -> dict:
             env["HTTPS_PROXY"] = env["HTTP_PROXY"] = p
             env.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")   # вход через браузер идёт на localhost
     return env
+
+
+# ---------- автозапуск с Windows ----------
+# Запись в HKCU\…\Run: только для текущего пользователя, прав администратора не нужно.
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "TG Autocomment"
+AUTOSTART_ARG = "--autostart"    # с ним окно стартует в трее и через AUTO_RUN_DELAY сек начинает работу
+AUTO_RUN_DELAY = 30              # время на подключение VPN и сети после входа в Windows
+
+
+def autostart_command() -> str:
+    exe = Path(sys.executable)
+    pyw = exe.with_name("pythonw.exe")   # без чёрного окна консоли
+    return f'"{pyw if pyw.exists() else exe}" "{BASE / "app.py"}" {AUTOSTART_ARG}'
+
+
+def get_autostart() -> str | None:
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return winreg.QueryValueEx(k, RUN_NAME)[0]
+    except OSError:
+        return None
+
+
+def set_autostart(on: bool):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if on:
+            winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, autostart_command())
+        else:
+            try:
+                winreg.DeleteValue(k, RUN_NAME)
+            except FileNotFoundError:
+                pass
 
 
 BACKEND_NAMES = {"claude_code": "Claude Code", "api": "Claude API", "gemini_cli": "Antigravity",
