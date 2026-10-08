@@ -5,6 +5,7 @@ config.json
 prompt*.txt
 !prompt.example.txt
 .env
+_builtin_api.py
 
 # Рабочие файлы программы
 log.txt

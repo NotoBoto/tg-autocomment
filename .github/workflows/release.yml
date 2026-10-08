@@ -43,6 +43,9 @@ jobs:
 
       - name: Сборка
         run: python build.py
+        env:   # встроенный ключ Telegram: Settings → Secrets and variables → Actions
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
 
       - uses: actions/upload-artifact@v4
         with:

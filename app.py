@@ -42,6 +42,7 @@ BACKENDS = {"Claude Code": "claude_code", "Claude API": "api",
 DEFAULT_MODEL = "(по умолчанию)"
 PROXY_MODES = {"Системный (из VPN)": "system", "Свой": "custom", "Без прокси": "none"}
 MODE_CONFIRM, MODE_AUTO = "Подтверждать вручную", "Публиковать сами"
+PUBLISH_MODES = {"С задержкой": "delayed", "Моментально": "instant"}
 
 log = logging.getLogger("autocomment")
 
@@ -80,6 +81,27 @@ def thumbnail(path: Path | None, box: int) -> ctk.CTkImage | None:
         return ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
     except Exception:
         return None
+
+
+def fmt_left(seconds: float) -> str:
+    """Обратный отсчёт: 0:45, 12:05, 1:02:03."""
+    s = max(0, int(seconds + 0.999))
+    h, m = divmod(s // 60, 60)
+    return f"{h}:{m:02}:{s % 60:02}" if h else f"{m}:{s % 60:02}"
+
+
+def parse_duration(text: str) -> float | None:
+    """Сколько добавить: «20» — минуты, «1,5» — полторы минуты, «1:30» — час тридцать. None — не разобрать."""
+    t = text.strip().lower().replace(",", ".")
+    try:
+        if ":" in t:
+            h, m = t.split(":", 1)
+            sec = (int(h or 0) * 60 + int(m or 0)) * 60
+        else:
+            sec = float(t) * 60
+    except ValueError:
+        return None
+    return sec if 0 < sec <= 7 * 24 * 3600 else None
 
 
 def open_path(p: Path):
@@ -603,6 +625,7 @@ class App(ctk.CTk):
         self.updating = False
         self.after(15_000, self.check_updates)
         self.after(100, self.poll)
+        self.after(1000, self.tick_schedule)
 
     # ------------------------------------------------------------------ обновления
 
@@ -1112,6 +1135,8 @@ class App(ctk.CTk):
     def on_mode(self, value):
         self.cfg["confirm_before_post"] = value == MODE_CONFIRM
         self.save()
+        if self.cfg["confirm_before_post"]:
+            self.engine.hold_scheduled()   # «подтверждать вручную» — значит, сами больше ничего не публикуем
         log.info("Режим%s: %s", f" «{self.cfg['name']}»" if len(self.engines) > 1 else "", value.lower())
         self.render_queue()
 
@@ -1173,7 +1198,8 @@ class App(ctk.CTk):
         self.link_msg = ctk.CTkLabel(lb, text="", text_color="gray", anchor="w")
         self.link_msg.grid(row=1, column=1, columnspan=2, sticky="w")
 
-        self.list_frame = ctk.CTkScrollableFrame(tab, width=260, label_text="Ждут решения")
+        self.list_frame = ctk.CTkScrollableFrame(tab, width=260, label_text="Очередь")
+        self.queue_btns: dict[str, ctk.CTkButton] = {}   # uid → кнопка в списке (для обратного отсчёта)
         self.list_frame.grid(row=1, column=0, sticky="ns", padx=(0, 10))
 
         self.empty = ctk.CTkLabel(tab, text="", font=ctk.CTkFont(size=15),
@@ -1191,6 +1217,7 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(weight="bold")).grid(row=2, column=0, sticky="w")
         self.comment_box = ctk.CTkTextbox(d, wrap="word", font=ctk.CTkFont(size=14))
         self.comment_box.grid(row=3, column=0, sticky="nsew", pady=(2, 4))
+        self.comment_box.bind("<KeyRelease>", lambda e: self.save_draft())
         d.grid_rowconfigure(3, weight=1)
 
         img_col = ctk.CTkFrame(d)
@@ -1228,8 +1255,28 @@ class App(ctk.CTk):
         self.regen_btn = ctk.CTkButton(wish, text="↻  Новый вариант", width=150, command=self.regenerate)
         self.regen_btn.grid(row=0, column=1, padx=(8, 0))
 
+        # Таймер автопубликации (режим «Публиковать сами», с задержкой)
+        self.sched = ctk.CTkFrame(d, fg_color=("gray88", "gray18"), corner_radius=8)
+        self.sched_lbl = ctk.CTkLabel(self.sched, text="", anchor="w", font=ctk.CTkFont(size=14, weight="bold"))
+        self.sched_lbl.grid(row=0, column=0, columnspan=7, sticky="w", padx=12, pady=(8, 2))
+        ctk.CTkLabel(self.sched, text="Добавить время:").grid(row=1, column=0, padx=(12, 6), pady=(2, 10))
+        self.sched_btns = []
+        for i, (label, sec) in enumerate((("+5 мин", 300), ("+15 мин", 900), ("+1 час", 3600))):
+            b = ctk.CTkButton(self.sched, text=label, width=74, fg_color=GRAY, hover_color=GRAY_HOVER,
+                              command=lambda s=sec: self.postpone(s))
+            b.grid(row=1, column=1 + i, padx=2, pady=(2, 10))
+            self.sched_btns.append(b)
+        self.postpone_entry = ctk.CTkEntry(self.sched, width=110, placeholder_text="мин или ч:мм")
+        self.postpone_entry.grid(row=1, column=4, padx=(10, 2), pady=(2, 10))
+        self.postpone_entry.bind("<Return>", lambda e: self.postpone_custom())
+        b = ctk.CTkButton(self.sched, text="Добавить", width=90, command=self.postpone_custom)
+        b.grid(row=1, column=5, padx=2, pady=(2, 10))
+        self.sched_btns += [b, self.postpone_entry]
+        self.sched_msg = ctk.CTkLabel(self.sched, text="", text_color=RED)
+        self.sched_msg.grid(row=1, column=6, padx=(8, 12), pady=(2, 10), sticky="w")
+
         actions = ctk.CTkFrame(d, fg_color="transparent")
-        actions.grid(row=7, column=0, columnspan=2, sticky="ew")
+        actions.grid(row=8, column=0, columnspan=2, sticky="ew")
         self.publish_btn = ctk.CTkButton(actions, text="✓  Опубликовать", height=42,
                                          font=ctk.CTkFont(size=15, weight="bold"),
                                          fg_color=GREEN, hover_color=GREEN_HOVER, command=self.publish)
@@ -1252,6 +1299,7 @@ class App(ctk.CTk):
         p = self.current()
         if p and not p.busy:
             p.comment = self.comment_box.get("1.0", "end-1c")
+            self.shown_comment[p.uid] = p.comment   # это уже показано — не вставлять заново
 
     def select(self, key):
         self.save_draft()
@@ -1263,25 +1311,20 @@ class App(ctk.CTk):
         if self.selected not in pending:
             self.selected = next(iter(pending), None)
 
-        multi = len(self.engines) > 1
         for w in self.list_frame.winfo_children():
             w.destroy()
+        self.queue_btns = {}
         for key, p in pending.items():
-            state = "⏳ генерирую…" if p.busy else ("⚠ ошибка" if p.error else "✓ готов")
-            snippet = (p.post_text or "(только медиа)").replace("\n", " ")[:60]
-            if (multi or len(core.channels(self.owner(p).cfg)) > 1) and p.channel:
-                snippet = f"{p.channel} · {snippet}"
-            who = f"{self.owner(p).cfg['name']} · " if multi else ""
-            ctk.CTkButton(
-                self.list_frame, text=f"{who}#{p.post_id}  {state}\n{snippet}", anchor="w",
+            b = self.queue_btns[key] = ctk.CTkButton(
+                self.list_frame, text=self.queue_text(p), anchor="w",
                 height=56, corner_radius=8,
                 fg_color=BTN_COLOR if key == self.selected else ("gray80", "gray25"),
                 text_color=("white", "white") if key == self.selected else ("gray10", "gray90"),
                 command=lambda k=key: self.select(k),
-            ).pack(fill="x", pady=3)
+            )
+            b.pack(fill="x", pady=3)
             # перенос длинного текста внутри кнопки
-            btns = self.list_frame.winfo_children()
-            btns[-1]._text_label.configure(wraplength=220, justify="left")
+            b._text_label.configure(wraplength=220, justify="left")
 
         n = len(pending)
         self.title(f"({n}) TG Автокомментатор" if n else "TG Автокомментатор")
@@ -1298,14 +1341,58 @@ class App(ctk.CTk):
                        "Хотите проверить промпт? Нажмите «Взять последний пост канала»\n"
                        "или вставьте ссылку на любой пост в поле сверху.")
             else:
-                msg = ("Автоматический режим: комментарии публикуются сами.\n"
-                       "Что происходит — во вкладке «Журнал».")
+                instant = (self.cfg.get("publish_mode") == "instant"
+                           and self.cfg.get("instant_comments"))
+                msg = (("Автоматический режим, моментально: под новым постом сразу появится заготовка,\n"
+                        "а потом её текст заменится комментарием нейросети." if instant else
+                        "Автоматический режим: комментарии публикуются сами после случайной паузы.\n"
+                        "Пока пауза идёт, комментарий виден здесь — можно добавить время,\n"
+                        "опубликовать сразу или отменить.")
+                       + "\nЧто происходит — во вкладке «Журнал».")
             self.empty.configure(text=msg)
             self.empty.grid(row=1, column=1, sticky="nsew")
             return
         self.empty.grid_forget()
         self.detail.grid(row=1, column=1, sticky="nsew")
         self.show_detail(p)
+
+    def queue_text(self, p: Pending) -> str:
+        multi = len(self.engines) > 1
+        if p.busy:
+            state = "⏳ в работе…"
+        elif p.error:
+            state = "⚠ ошибка"
+        elif p.publish_at:
+            state = f"⏱ через {fmt_left(p.publish_at - time.time())}"
+        else:
+            state = "✓ готов"
+        snippet = (p.post_text or "(только медиа)").replace("\n", " ")[:60]
+        if (multi or len(core.channels(self.owner(p).cfg)) > 1) and p.channel:
+            snippet = f"{p.channel} · {snippet}"
+        who = f"{self.owner(p).cfg['name']} · " if multi else ""
+        return f"{who}#{p.post_id}  {state}\n{snippet}"
+
+    def sched_text(self, p: Pending) -> str:
+        at = time.strftime("%H:%M:%S", time.localtime(p.publish_at))
+        return f"⏱  Опубликуется сам через {fmt_left(p.publish_at - time.time())}  (в {at})"
+
+    def tick_schedule(self):
+        """Раз в секунду — обратный отсчёт в списке и в карточке, без перерисовки всей очереди."""
+        try:
+            pending = self.all_pending()
+            for uid, b in self.queue_btns.items():
+                p = pending.get(uid)
+                if p and p.publish_at and not p.busy:
+                    text = self.queue_text(p)
+                    if b.cget("text") != text:
+                        b.configure(text=text)
+            p = self.current()
+            if p and p.publish_at and not p.busy:
+                self.sched_lbl.configure(text=self.sched_text(p))
+        except Exception:
+            log.exception("Ошибка в окне программы")
+        finally:
+            self.after(1000, self.tick_schedule)
 
     def show_detail(self, p: Pending):
         e = self.owner(p)
@@ -1338,8 +1425,18 @@ class App(ctk.CTk):
                                    text_color="gray")
         else:
             self.err_lbl.configure(text=p.error, text_color=RED)
+        if p.publish_at:
+            self.sched_lbl.configure(text=self.sched_text(p))
+            self.sched_msg.configure(text="")
+            self.sched.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+            self.publish_btn.configure(text="✓  Опубликовать сейчас")
+            self.skip_btn.configure(text="✕  Отменить публикацию")
+        else:
+            self.sched.grid_forget()
+            self.publish_btn.configure(text="✓  Опубликовать")
+            self.skip_btn.configure(text="Пропустить пост")
         st = "disabled" if p.busy else "normal"
-        for b in (self.publish_btn, self.skip_btn, self.regen_btn, *self.img_btns):
+        for b in (self.publish_btn, self.skip_btn, self.regen_btn, *self.img_btns, *self.sched_btns):
             b.configure(state=st)
         self.comment_box.configure(state=st)
         if not p.comment and not p.busy:
@@ -1395,6 +1492,20 @@ class App(ctk.CTk):
         if p := self.current():
             self.owner(p).skip(p.key)
 
+    def postpone(self, seconds: float):
+        if p := self.current():
+            self.save_draft()
+            self.owner(p).postpone(p.key, seconds)
+
+    def postpone_custom(self):
+        seconds = parse_duration(self.postpone_entry.get())
+        if seconds is None:
+            self.sched_msg.configure(text="Минуты (20) или часы:минуты (1:30)")
+            return
+        self.sched_msg.configure(text="")
+        self.postpone_entry.delete(0, "end")
+        self.postpone(seconds)
+
     # ------------------------------------------------------------------ настройки
 
     def _build_settings_tab(self, tab):
@@ -1407,7 +1518,10 @@ class App(ctk.CTk):
             "👋  Добро пожаловать! Для начала работы:\n"
             "0. В блоке «Нейросеть» выберите способ: Claude Code, Antigravity или ChatGPT (вход в аккаунт, "
             "кнопка «Установить и войти»), API-ключ Claude/Gemini/OpenAI или свою модель (LM Studio, Ollama)\n"
-            "1. Получите API ID и API Hash на my.telegram.org (раздел «API development tools»)\n"
+            + ("1. API ID и API Hash указывать не нужно — в программу встроен свой ключ\n"
+               if core.BUILTIN_TELEGRAM_APP else
+               "1. Получите API ID и API Hash на my.telegram.org (раздел «API development tools»)\n")
+            + 
             "2. Укажите канал, под постами которого нужно комментировать\n"
             "3. Заполните вкладку «Промпт» — инструкцию для нейросети\n"
             "4. Нажмите «Сохранить», затем «▶ Запустить» — программа предложит войти в Telegram\n"
@@ -1436,12 +1550,16 @@ class App(ctk.CTk):
 
         tg = section("Telegram")
         self.settings_first = tg
-        field(tg, 2, "api_id", "API ID", width=200)
-        hash_e = field(tg, 3, "api_hash", "API Hash", show="•")
+        builtin = core.BUILTIN_TELEGRAM_APP is not None
+        field(tg, 2, "api_id", "API ID", "необязательно — пусто: встроенный ключ" if builtin else "",
+              width=200, placeholder_text="встроенный" if builtin else "")
+        hash_e = field(tg, 3, "api_hash", "API Hash", show="•",
+                       placeholder_text="встроенный" if builtin else "")
         ctk.CTkButton(tg, text="показать", width=80, fg_color=GRAY, hover_color=GRAY_HOVER,
                       command=lambda: hash_e.configure(show="" if hash_e.cget("show") else "•")
                       ).grid(row=3, column=2, sticky="w", padx=10)
-        ctk.CTkButton(tg, text="Где взять API ID и Hash → my.telegram.org", fg_color="transparent",
+        ctk.CTkButton(tg, text=("Свой ключ (по желанию) → my.telegram.org" if builtin
+                                else "Где взять API ID и Hash → my.telegram.org"), fg_color="transparent",
                       text_color=("#1f6aa5", "#5aa9e6"), hover=False, anchor="w",
                       command=lambda: webbrowser.open("https://my.telegram.org/apps")
                       ).grid(row=4, column=1, sticky="w")
@@ -1613,15 +1731,41 @@ class App(ctk.CTk):
         self.img_count = ctk.CTkLabel(im, text="", text_color="gray")
         self.img_count.grid(row=3, column=1, sticky="w", padx=4)
         ctk.CTkLabel(im, text="Прикладывать картинку").grid(row=4, column=0, sticky="w", padx=14, pady=(5, 12))
-        self.chance_lbl = ctk.CTkLabel(im, text="", width=50)
-        self.chance = ctk.CTkSlider(im, from_=0, to=100, number_of_steps=20,
-                                    command=lambda v: self.chance_lbl.configure(text=f"{int(v)}%"))
-        self.chance.grid(row=4, column=1, sticky="ew", padx=4, pady=(5, 12))
-        self.chance_lbl.grid(row=4, column=2, sticky="w", padx=10, pady=(5, 12))
+        # Поле, а не слайдер: точное значение, и прокрутка колёсиком его случайно не сдвинет
+        chance_row = ctk.CTkFrame(im, fg_color="transparent")
+        chance_row.grid(row=4, column=1, columnspan=2, sticky="w", padx=4, pady=(5, 12))
+        self.chance = ctk.CTkEntry(chance_row, width=60, justify="right")
+        self.chance.pack(side="left")
+        ctk.CTkLabel(chance_row, text="%   0 — никогда, 100 — к каждому комментарию",
+                     text_color="gray").pack(side="left", padx=(6, 0))
 
-        au = section("Автоматический режим", "Случайная пауза перед публикацией — выглядит естественнее")
-        field(au, 2, "delay_min_sec", "Пауза от, сек", width=80)
-        field(au, 3, "delay_max_sec", "Пауза до, сек", width=80)
+        au = section("Автоматический режим", "Как публиковать, когда в шапке выбрано «Публиковать сами»")
+        au.grid_columnconfigure(0, minsize=LABEL_W)
+        ctk.CTkLabel(au, text="Публикация").grid(row=2, column=0, sticky="w", padx=14, pady=5)
+        self.publish_mode = ctk.CTkSegmentedButton(au, values=list(PUBLISH_MODES),
+                                                   command=lambda v: self.show_publish_mode())
+        self.publish_mode.grid(row=2, column=1, sticky="w", padx=4)
+
+        def sub_au(hint):
+            f = ctk.CTkFrame(au, fg_color="transparent")
+            f.grid_columnconfigure(0, minsize=LABEL_W)
+            f.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(f, text=hint, text_color="gray", justify="left", wraplength=900).grid(
+                row=0, column=0, columnspan=3, sticky="w", padx=14)
+            return f
+
+        dl = sub_au("Нейросеть пишет комментарий, затем случайная пауза — выглядит естественнее")
+        field(dl, 1, "delay_min_sec", "Пауза от, сек", width=80)
+        field(dl, 2, "delay_max_sec", "Пауза до, сек", width=80)
+        ins = sub_au("Под новым постом сразу появляется заготовка — так комментарий окажется среди первых. "
+                     "Когда нейросеть напишет настоящий, текст заготовки заменится им (в Telegram будет "
+                     "пометка «изменено»). Если нейросеть ответит SKIP — заготовка удалится")
+        ctk.CTkLabel(ins, text="Заготовки").grid(row=1, column=0, sticky="nw", padx=14, pady=8)
+        self.instant_box = ctk.CTkTextbox(ins, height=110)
+        self.instant_box.grid(row=1, column=1, sticky="ew", padx=4, pady=(5, 12))
+        ctk.CTkLabel(ins, text="по одной на строку,\nберётся случайная", text_color="gray",
+                     justify="left").grid(row=1, column=2, sticky="nw", padx=10, pady=5)
+        self.publish_frames = {"delayed": dl, "instant": ins}
 
         fl = section("Стоп-слова",
                      "Посты с этими словами пропускаются без генерации. По одному на строку; "
@@ -1760,6 +1904,14 @@ class App(ctk.CTk):
             else:
                 f.grid_forget()
 
+    def show_publish_mode(self):
+        current = PUBLISH_MODES.get(self.publish_mode.get(), "delayed")
+        for key, f in self.publish_frames.items():
+            if key == current:
+                f.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 6))
+            else:
+                f.grid_forget()
+
     def update_price(self):
         m = self.api_model.get()
         self.price_lbl.configure(text=f"цена за 1M токенов (вход / выход): {core.API_PRICES.get(m, '?')}"
@@ -1784,10 +1936,14 @@ class App(ctk.CTk):
         self.backend.set(next(k for k, v in BACKENDS.items() if v == c.get("backend", "claude_code")))
         self.show_backend()
         self.update_price()
-        self.chance.set(float(c["attach_image_chance"]) * 100)
-        self.chance_lbl.configure(text=f"{int(float(c['attach_image_chance']) * 100)}%")
+        self.chance.delete(0, "end")
+        self.chance.insert(0, f"{float(c['attach_image_chance']) * 100:g}")
         self.keywords.delete("1.0", "end")
         self.keywords.insert("1.0", "\n".join(c["skip_keywords"]))
+        self.publish_mode.set(next(k for k, v in PUBLISH_MODES.items() if v == c.get("publish_mode", "delayed")))
+        self.show_publish_mode()
+        self.instant_box.delete("1.0", "end")
+        self.instant_box.insert("1.0", "\n".join(c["instant_comments"]))
         self.update_img_count()
 
     def update_img_count(self):
@@ -1851,8 +2007,20 @@ class App(ctk.CTk):
         new["compat_base_url"] = f["compat_base_url"]
         new["compat_api_key"] = f["compat_api_key"]
         new["compat_model"] = self.compat_model.get().strip()
-        new["attach_image_chance"] = round(self.chance.get() / 100, 2)
+        try:
+            chance = float(self.chance.get().strip().rstrip("%").replace(",", ".") or "nan")
+        except ValueError:
+            chance = float("nan")
+        if not 0 <= chance <= 100:   # nan сюда тоже не пройдёт
+            messagebox.showerror("Настройки", "Шанс приложить картинку — число от 0 до 100")
+            return False
+        new["attach_image_chance"] = round(chance / 100, 4)
         new["skip_keywords"] = [w.strip() for w in self.keywords.get("1.0", "end").splitlines() if w.strip()]
+        new["publish_mode"] = PUBLISH_MODES.get(self.publish_mode.get(), "delayed")
+        new["instant_comments"] = [w.strip() for w in self.instant_box.get("1.0", "end").splitlines() if w.strip()]
+        if new["publish_mode"] == "instant" and not new["instant_comments"] and not new["confirm_before_post"]:
+            messagebox.showerror("Настройки", "Для моментальной публикации нужна хотя бы одна заготовка")
+            return False
 
         restart_keys = ("api_id", "api_hash", "channels", "session_name", "proxy_mode", "proxy")
         needs_restart = self.engine.status != "stopped" and any(new[k] != self.cfg[k] for k in restart_keys)
@@ -1862,6 +2030,7 @@ class App(ctk.CTk):
         self.save()
         self.update_channel_menu()
         self.load_settings_form()
+        self.render_queue()   # подсказка пустой очереди зависит от режима публикации
         if not silent:
             self.welcome.pack_forget()
             msg = "Сохранено ✓"
@@ -2003,6 +2172,9 @@ class App(ctk.CTk):
         elif kind == "pending":
             if self.selected is None:
                 self.selected = data.uid
+            if data.publish_at:   # автопубликация по таймеру: без звука и уведомлений
+                self.render_queue()
+                return
             self.tabs.set("Очередь")
             self.render_queue()
             self.bell()
@@ -2043,14 +2215,21 @@ class App(ctk.CTk):
 
     def quit_app(self):
         self.show_window()   # вопросы ниже должны быть видны, даже если окно было в трее
-        waiting = len(self.all_pending())
+        pending = list(self.all_pending().values())
+        scheduled = sum(1 for p in pending if p.publish_at)
+        waiting = len(pending) - scheduled
         if waiting and not messagebox.askyesno(
                 "Выход", f"В очереди {waiting} непроверенных комментариев. Выйти?"):
             return
+        if scheduled and not messagebox.askyesno(
+                "Выход", f"Ждут автопубликации по таймеру: {scheduled}. "
+                         "После выхода они не будут опубликованы. Выйти?"):
+            return
         busy = sum(e.busy_auto() for e in self.engines.values())
         if busy and not messagebox.askyesno(
-                "Выход", f"Ещё пишутся или ждут паузы перед публикацией комментариев: {busy}. "
-                         "После выхода они не будут опубликованы. Выйти?"):
+                "Выход", f"Нейросеть ещё пишет комментарии: {busy}. "
+                         "После выхода они не будут опубликованы, а уже опубликованные заготовки "
+                         "моментального режима не заменятся комментарием нейросети. Выйти?"):
             return
         if self.prompt_dirty() and messagebox.askyesno("Промпт", "Сохранить изменения в промпте?"):
             self.save_prompt()

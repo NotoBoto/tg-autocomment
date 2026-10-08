@@ -18,12 +18,14 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.3.3"
+VERSION = "0.4.0"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -52,7 +54,7 @@ SKIP_RULE = (
 DEFAULTS = {
     "name": "Основной",            # название профиля (аккаунта) в окне
     "enabled": True,               # запускать ли профиль кнопкой «▶ Запустить»
-    "api_id": "",
+    "api_id": "",                  # своё приложение Telegram; пусто — встроенное (если есть в сборке)
     "api_hash": "",
     "session_name": "my_account",
     "proxy_mode": "system",        # прокси для Telegram: system (из VPN/Windows) | custom | none
@@ -77,6 +79,9 @@ DEFAULTS = {
     "delay_min_sec": 20,
     "delay_max_sec": 90,
     "confirm_before_post": True,
+    "publish_mode": "delayed",     # автоматический режим: delayed — пауза и комментарий | instant — сразу
+                                   # заготовка, потом её текст заменяется сгенерированным
+    "instant_comments": ["Интересно", "О, любопытно", "Хм", "Ого"],
     "skip_keywords": ["погиб", "умер", "скончал", "теракт", "катастроф",
                       "траур", "соболезн", "жертв", "пожар", "убит"],
     "claude_timeout_sec": 120,
@@ -85,6 +90,28 @@ DEFAULTS = {
 }
 
 log = logging.getLogger("autocomment")
+
+# Почему Telegram не принял комментарий — по-человечески
+SEND_ERRORS = {
+    errors.MsgIdInvalidError: "У поста нет обсуждения (комментарии выключены)",
+    errors.ChatWriteForbiddenError: "Аккаунту нельзя писать в группе обсуждения",
+    errors.ChatGuestSendForbiddenError: "Писать в обсуждении могут только участники группы — "
+                                        "вступите в неё этим аккаунтом",
+    errors.ChannelPrivateError: "Нет доступа к группе обсуждения: аккаунт забанен или группа закрыта",
+    errors.UserBannedInChannelError: "Telegram запретил аккаунту писать в группах — обычно это "
+                                     "спам-блок, подробности у @SpamBot",
+    errors.PeerFloodError: "Telegram ограничил аккаунт за подозрение в спаме — подробности у @SpamBot",
+    errors.ChatRestrictedError: "Группа обсуждения ограничена Telegram",
+    errors.ChatSendPlainForbiddenError: "В группе обсуждения нельзя писать без картинки",
+    errors.FrozenMethodInvalidError: "Telegram заморозил аккаунт — подробности у @SpamBot",
+}
+
+
+def send_error_text(e: Exception) -> str:
+    return next((text for cls, text in SEND_ERRORS.items() if isinstance(e, cls)), f"Не удалось отправить: {e}")
+# Писать можно, а прикладывать картинки нет — тогда комментарий уходит без картинки
+MEDIA_FORBIDDEN = (errors.ChatSendMediaForbiddenError, errors.ChatSendPhotosForbiddenError,
+                   errors.ChatSendVideosForbiddenError, errors.ChatSendGifsForbiddenError)
 
 
 # ---------- настройки ----------
@@ -284,15 +311,58 @@ def open_claude_login():
                      env=cli_env(), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
 
 
+def _builtin_telegram_app() -> tuple[int, str] | None:
+    """Встроенное приложение Telegram. Модуль _builtin_api.py создаёт build.py из секретов
+    сборки; в репозитории его нет. Значения в нём замаскированы — только от поиска строк в .exe."""
+    try:
+        from _builtin_api import BLOB, MASK
+        api_id, api_hash = bytes(b ^ MASK[i % len(MASK)] for i, b in enumerate(BLOB)).decode().split(":")
+        return int(api_id), api_hash
+    except Exception:
+        return None
+
+
+BUILTIN_TELEGRAM_APP = _builtin_telegram_app()
+
+
+def telegram_app(cfg) -> tuple[int, str] | None:
+    """(api_id, api_hash) для подключения: свои из настроек, если указаны, иначе встроенные."""
+    own_id, own_hash = str(cfg.get("api_id", "")).strip(), str(cfg.get("api_hash", "")).strip()
+    if own_id or own_hash:
+        return (int(own_id), own_hash) if own_id.isdigit() and own_hash else None
+    return BUILTIN_TELEGRAM_APP
+
+
+# Telegram не принял ключ приложения: неверный или заблокирован (ключ попал в открытый доступ)
+API_KEY_ERRORS = (errors.ApiIdInvalidError, errors.ApiIdPublishedFloodError)
+
+
+def api_key_error(cfg) -> str:
+    """Понятное объяснение, когда Telegram отверг API ID / API Hash, — свои или встроенные."""
+    if str(cfg.get("api_id", "")).strip() or str(cfg.get("api_hash", "")).strip():
+        return ("Telegram не принял ваши API ID и API Hash — проверьте их в «Настройках»"
+                + (" или очистите оба поля, чтобы работать со встроенным ключом" if BUILTIN_TELEGRAM_APP else ""))
+    return ("Telegram не принял встроенный ключ программы. Обновите программу («Настройки» → «Программа» → "
+            "«Проверить обновления») или укажите свои API ID и API Hash с my.telegram.org")
+
+
 def validate(cfg) -> list[str]:
     """Список понятных проблем, мешающих запуску."""
     problems = []
-    if not str(cfg.get("api_id", "")).strip().isdigit():
-        problems.append("Не указан API ID (число с my.telegram.org)")
-    if not str(cfg.get("api_hash", "")).strip():
-        problems.append("Не указан API Hash (с my.telegram.org)")
+    if not telegram_app(cfg):
+        own_id, own_hash = str(cfg.get("api_id", "")).strip(), str(cfg.get("api_hash", "")).strip()
+        if own_id or own_hash:
+            problems.append("Укажите и API ID (число), и API Hash — или очистите оба поля, "
+                            "чтобы работать со встроенным ключом" if BUILTIN_TELEGRAM_APP else
+                            "Укажите и API ID (число), и API Hash с my.telegram.org")
+        else:
+            problems.append("Не указаны API ID и API Hash (с my.telegram.org)")
     if not channels(cfg):
         problems.append("Не указан ни один канал")
+    if (cfg.get("publish_mode") == "instant" and not cfg.get("confirm_before_post", True)
+            and not cfg.get("instant_comments")):
+        problems.append("Выбрана моментальная публикация, но нет заготовок — "
+                        "«Настройки» → «Автоматический режим»")
     if cfg.get("proxy_mode") == "custom" and not str(cfg.get("proxy", "")).strip():
         problems.append("Выбран свой прокси, но адрес не указан")
     try:
@@ -783,7 +853,14 @@ class Pending:
     post_images: list[Path] = field(default_factory=list)
     comment: str = ""
     image: Path | None = None
+    media_ok: bool = True    # можно ли прикладывать картинку в группе обсуждения
+    plain_ok: bool = True    # можно ли писать без картинки
+    reply_peer: object = None   # группа обсуждения и id поста в ней — из проверки прав,
+    reply_to: int = 0           # чтобы отправка не спрашивала их у Telegram ещё раз
+    sent_chat: int = 0       # где и под каким id опубликован (группа обсуждения) —
+    sent_id: int = 0         # нужен, чтобы заменить заготовку настоящим комментарием
     busy: bool = False       # идёт генерация/отправка
+    publish_at: float = 0.0  # автопубликация по таймеру: когда (time.time()); 0 — ждёт решения человека
     error: str = ""
 
     @property
@@ -845,7 +922,7 @@ class Engine:
         self.pending: dict[str, Pending] = {}
         self.done_posts = set(self.done_file.read_text().split()) if self.done_file.exists() else set()
         self._image_bag: list[Path] = []
-        self._seen_groups: set[int] = set()
+        self._seen_groups: dict[int, None] = {}   # альбомы, уже взятые в работу (по порядку — для чистки)
         self._gen_lock: asyncio.Lock | None = None
         self._api_client = None
         self._api_client_key = None
@@ -919,8 +996,8 @@ class Engine:
                             "username": proxy["user"], "password": proxy["password"], "rdns": True}}
         if proxy:
             self.log.info("Подключаюсь к Telegram через прокси %s", proxy_label(proxy))
-        self.client = TelegramClient(str(BASE / cfg["session_name"]),
-                                     int(cfg["api_id"]), str(cfg["api_hash"]).strip(), **kw)
+        api_id, api_hash = telegram_app(cfg)
+        self.client = TelegramClient(str(BASE / cfg["session_name"]), api_id, api_hash, **kw)
         try:
             await self.client.connect()
         except Exception as e:
@@ -959,6 +1036,8 @@ class Engine:
             try:
                 await self.client.send_code_request(self._phone)
                 self._emit("code_sent")
+            except API_KEY_ERRORS:
+                self._emit("login_error", api_key_error(self.cfg))
             except Exception as e:
                 self._emit("login_error", f"Не удалось отправить код: {e}")
         self._submit(go())
@@ -993,18 +1072,23 @@ class Engine:
             if self._qr_task:
                 self._qr_task.cancel()
             self._qr_task = asyncio.current_task()
-            qr = await self.client.qr_login()
-            while True:
-                self._emit("qr", qr.url)
-                try:
-                    await qr.wait(timeout=30)
-                    break
-                except asyncio.TimeoutError:
-                    await qr.recreate()
-                except errors.SessionPasswordNeededError:
-                    self._qr_task = None
-                    self._emit("password_needed")
-                    return
+            try:
+                qr = await self.client.qr_login()
+                while True:
+                    self._emit("qr", qr.url)
+                    try:
+                        await qr.wait(timeout=30)
+                        break
+                    except asyncio.TimeoutError:
+                        await qr.recreate()
+            except errors.SessionPasswordNeededError:
+                self._qr_task = None
+                self._emit("password_needed")
+                return
+            except API_KEY_ERRORS:
+                self._qr_task = None
+                self._emit("login_error", api_key_error(self.cfg))
+                return
             self._qr_task = None
             await self._after_login()
         self._submit(go())
@@ -1085,11 +1169,14 @@ class Engine:
 
     # --- обработка постов ---
 
-    async def _collect_post(self, msg):
+    async def _collect_post(self, msg, wait=True):
         """Возвращает (id для коммента, текст, список сообщений с медиа). Склеивает альбомы."""
         if not msg.grouped_id:
             return msg.id, msg.raw_text or "", [msg]
-        await asyncio.sleep(2)  # даём долететь остальным частям альбома
+        # Альбом публикуется целиком, на сервере все части есть сразу; пауза — запас на случай
+        # задержек. Моментальному режиму важнее скорость
+        if wait:
+            await asyncio.sleep(2)
         around = await self.client.get_messages(msg.chat_id,
                                                 ids=list(range(msg.id - 10, msg.id + 11)))
         parts = sorted((m for m in around if m and m.grouped_id == msg.grouped_id),
@@ -1162,11 +1249,6 @@ class Engine:
             if not msg:
                 self.log.warning("Пост #%s в %s не найден — удалён или ссылка неверная", post_id, name)
                 return
-            # У альбома сведения о комментариях есть не у каждой части — его не проверяем
-            if not msg.grouped_id and not (msg.replies and msg.replies.comments):
-                self.log.warning("Под постом #%s в %s нельзя комментировать — у канала выключены комментарии",
-                                 post_id, name)
-                return
             self.channel_names[utils.get_peer_id(ent)] = name
             await self._handle_post(msg, manual=True)
         self._submit(go())
@@ -1176,9 +1258,14 @@ class Engine:
         if msg.grouped_id and not manual:
             if msg.grouped_id in self._seen_groups:   # альбом уже обрабатывается
                 return
-            self._seen_groups.add(msg.grouped_id)
+            # Проверка и отметка — до первого await, иначе части альбома проскочат обе
+            self._seen_groups[msg.grouped_id] = None
+            if len(self._seen_groups) > 500:   # программа работает неделями — старые не нужны
+                del self._seen_groups[next(iter(self._seen_groups))]
 
-        post_id, post_text, parts = await self._collect_post(msg)
+        confirm = manual or cfg.get("confirm_before_post", True)
+        instant = self._instant(confirm)
+        post_id, post_text, parts = await self._collect_post(msg, wait=not instant)
         key = f"{msg.chat_id}:{post_id}"
         queued = any(q.post_key == key for q in self.pending.values()) or key in self.inflight
         if not manual:
@@ -1193,6 +1280,16 @@ class Engine:
                 self.log.info("Пост #%s уже в очереди — готовлю ещё один вариант", post_id)
             if queued or key in self.pending:
                 key = f"{key}#{next(self._manual_seq)}"
+        # Занимаем ключ сразу, до следующего await: иначе тот же пост, взятый в это время вручную
+        # или пришедший ещё раз, получит тот же ключ. Пока пост в работе — выход и обновление ждут
+        self.inflight.add(key)
+        try:
+            await self._take_post(msg, key, post_id, post_text, parts, manual, confirm, instant)
+        finally:
+            self.inflight.discard(key)
+
+    async def _take_post(self, msg, key, post_id, post_text, parts, manual, confirm, instant):
+        cfg = self.cfg
         chan = self.channel_names.get(msg.chat_id, "")
         self.log.info("Новый пост %s #%s: %s", chan, post_id, post_text[:80].replace("\n", " "))
 
@@ -1207,21 +1304,79 @@ class Engine:
             return
 
         p = Pending(key=key, chat_id=msg.chat_id, post_id=post_id, post_text=post_text, channel=chan,
-                    profile=self.cfg["id"])
-        # Пока пост в работе (генерация, пауза перед автопубликацией), выход и автообновление ждут
-        self.inflight.add(key)
+                    profile=cfg["id"])
+        # В моментальном режиме важна скорость: проверка прав — лишний запрос, а отказ Telegram
+        # всё равно остановит работу на заготовке, до запроса к нейросети
+        if not instant:
+            block = await self._check_rights(p)
+            if block:
+                (self.log.warning if manual else self.log.info)("Пост #%s %s: %s — пропуск", post_id, chan, block)
+                return
+        await self._comment_on(p, parts, confirm, instant, see_images and has_media)
+
+    async def _check_rights(self, p: Pending) -> str:
+        """Можно ли комментировать пост; "" — можно. Заодно запоминает в p группу обсуждения
+        и что в ней разрешено (картинки, текст без картинки).
+
+        Права в группе обсуждения смотрим заранее, чтобы не тратить запрос к нейросети.
+        Если проверить не удалось — не мешаем: точный ответ всё равно даст отправка.
+        """
+        from telethon.tl import functions, types
         try:
-            await self._comment_on(p, parts, manual or cfg.get("confirm_before_post", True),
-                                   see_images and has_media)
-        finally:
-            self.inflight.discard(key)
+            d = await self.client(functions.messages.GetDiscussionMessageRequest(p.chat_id, p.post_id))
+            # Как в Telethon (comment_to): пост в группе — первое из сообщений обсуждения
+            top = min(d.messages, key=lambda m: m.id)
+            group = next(c for c in d.chats if utils.get_peer_id(c) == utils.get_peer_id(top.peer_id))
+        except errors.MsgIdInvalidError:
+            return "у канала выключены комментарии"
+        except errors.ChannelPrivateError:
+            return SEND_ERRORS[errors.ChannelPrivateError].lower()
+        except Exception as e:   # сеть, неожиданный ответ — решит сама отправка
+            self.log.debug("Права в обсуждении поста #%s не проверены: %s", p.post_id, e)
+            return ""
+        if isinstance(group, types.ChannelForbidden):
+            return "аккаунт забанен в группе обсуждения"
+        p.reply_peer, p.reply_to = utils.get_input_peer(group), top.id
+        # У «min»-версии канала личные права недостоверны; админам ограничения не страшны
+        if not isinstance(group, types.Channel) or group.min or group.creator or group.admin_rights:
+            return ""
+        own, everyone = group.banned_rights, group.default_banned_rights
+        if group.left and group.join_to_send:
+            return "писать в обсуждении могут только участники группы — вступите в неё этим аккаунтом"
+        if own and own.send_messages:
+            until = own.until_date
+            # Срок вне (0; 366 дней] Telegram считает вечным — дату тогда не пишем
+            soon = until and timedelta(0) < until - datetime.now(timezone.utc) < timedelta(days=366)
+            return ("аккаунту запрещено писать в группе обсуждения"
+                    + (f" до {until.astimezone():%d.%m %H:%M}" if soon else ""))
+        if everyone and everyone.send_messages:
+            return "в группе обсуждения писать могут только админы"
+        rights = [r for r in (own, everyone) if r]
+        p.media_ok = not any(r.send_media or r.send_photos for r in rights)
+        p.plain_ok = not any(r.send_plain for r in rights)
+        if not p.plain_ok and not (p.media_ok and list_images(self.cfg)):
+            return "в группе обсуждения можно писать только с картинкой, а картинок нет или они запрещены"
+        return ""
 
     def busy_auto(self) -> int:
         """Сколько постов в работе вне очереди подтверждения — автопубликация ещё не закончена."""
         return len(self.inflight - self.pending.keys())
 
-    async def _comment_on(self, p: Pending, parts, confirm: bool, with_images: bool):
+    def _instant(self, confirm: bool) -> bool:
+        """Моментальная публикация: только в автоматическом режиме и если есть заготовки
+        (без заготовок — обычная публикация с задержкой)."""
+        return (not confirm and self.cfg.get("publish_mode") == "instant"
+                and bool(self.cfg.get("instant_comments")))
+
+    async def _comment_on(self, p: Pending, parts, confirm: bool, instant: bool, with_images: bool):
         cfg, post_id = self.cfg, p.post_id
+        if instant:
+            p.comment = random.choice(cfg["instant_comments"])
+            p.image = self.pick_image()
+            self.log.info("Пост #%s: сразу публикую заготовку «%s», настоящий комментарий заменит её",
+                          post_id, p.comment)
+            if not await self._send(p):
+                return
         if with_images:
             # Своя папка у каждого варианта: картинки двух вариантов одного поста не мешают друг другу
             folder = self.media_dir / p.key.replace(":", "_").replace("#", "_")
@@ -1234,12 +1389,18 @@ class Engine:
             self.pending[key] = p
             self._emit("pending", p)
 
+        if instant:
+            await self._replace_placeholder(p)
+            self._cleanup(p)
+            return
+
         try:
             p.comment = await self._generate(post_text, p.post_images) or ""
         except Exception as e:
             p.error = self._ai_error(e)
             self.log.error("%s", p.error)
-        p.image = self.pick_image()
+        # Где без картинки писать нельзя — берём её из колоды независимо от «Прикладывать картинку»
+        p.image = self.pick_image(force=not p.plain_ok) if p.media_ok else None
 
         if not p.comment and not p.error:
             self.log.info("Пост #%s: модель решила пропустить (SKIP)", post_id)
@@ -1256,11 +1417,78 @@ class Engine:
         if p.error:
             self._cleanup(p)
             return
+        # Пауза перед публикацией — в очереди с таймером: там видно, когда уйдёт, можно отложить
+        # или опубликовать сразу
         delay = random.randint(cfg["delay_min_sec"], max(cfg["delay_min_sec"], cfg["delay_max_sec"]))
-        self.log.info("Пост #%s: жду %s сек перед публикацией", post_id, delay)
-        await asyncio.sleep(delay)
-        await self._send(p)
-        self._cleanup(p)
+        p.publish_at = time.time() + delay
+        self.pending[key] = p
+        self._emit("pending", p)
+        self.log.info("Пост #%s: опубликую через %s сек — отложить или опубликовать сразу можно в «Очереди»",
+                      post_id, delay)
+        if await self._wait_schedule(p):
+            await self._publish_pending(p)
+
+    async def _wait_schedule(self, p: Pending) -> bool:
+        """Ждёт времени автопубликации. True — пора, и p уже помечен busy; False — пост пропустили,
+        аккаунт остановили или сняли пост с таймера (тогда он ждёт решения в очереди)."""
+        while True:
+            if self.pending.get(p.key) is not p or not p.publish_at:
+                return False
+            # Проверка и пометка busy — без await между ними: кнопка «Опубликовать» из окна
+            # выполняется в этом же цикле и не опубликует пост второй раз
+            if not p.busy and time.time() >= p.publish_at:
+                if p.error or not p.comment.strip():   # новый вариант не удался — решать человеку
+                    p.publish_at = 0
+                    self.log.warning("Пост #%s: не публикую сам — %s", p.post_id,
+                                     p.error or "комментарий пустой")
+                    self._emit("pending_update", p)
+                    return False
+                p.busy = True
+                return True
+            await asyncio.sleep(0.5)
+
+    async def _publish_pending(self, p: Pending):
+        """Отправить пост из очереди; p.busy уже выставлен вызывающим."""
+        p.publish_at = 0
+        self._emit("pending_update", p)
+        ok = await self._send(p)
+        p.busy = False
+        if ok:
+            self._finish(p, "published")
+        else:   # остаётся в очереди с ошибкой — повторить или пропустить решит человек
+            self._emit("pending_update", p)
+
+    async def _replace_placeholder(self, p: Pending):
+        """Заготовка уже под постом — заменить её текст сгенерированным комментарием."""
+        try:
+            text = await self._generate(p.post_text, p.post_images)
+        except Exception as e:
+            self.log.error("%s — под постом #%s остаётся заготовка", self._ai_error(e), p.post_id)
+            return
+        if not text:
+            # Тяжёлая тема: дежурное «Интересно» под таким постом хуже, чем ничего
+            try:
+                await self.client.delete_messages(p.sent_chat, [p.sent_id])
+                self.log.info("Пост #%s: модель решила пропустить (SKIP) — заготовка удалена", p.post_id)
+            except Exception as e:
+                self.log.error("Пост #%s: модель ответила SKIP, но заготовку удалить не удалось: %s",
+                               p.post_id, e)
+            return
+        try:
+            await self._with_flood_wait(lambda: self.client.edit_message(p.sent_chat, p.sent_id, text))
+            self.log.info("✏️ Заготовка под #%s заменена сгенерированным комментарием", p.post_id)
+            return
+        except errors.MessageNotModifiedError:
+            return
+        except errors.FloodWaitError as e:
+            err = f"Telegram ограничил отправку на {e.seconds} сек"
+        except errors.MediaCaptionTooLongError:
+            err = "комментарий длиннее 1024 символов — в подпись к картинке не помещается"
+        except errors.MessageIdInvalidError:
+            err = "заготовку удалили"
+        except Exception as e:
+            err = str(e)
+        self.log.error("Пост #%s: заготовку заменить не удалось (%s)", p.post_id, err)
 
     def _ai_error(self, e: Exception) -> str:
         return explain_ai_error(BACKEND_NAMES.get(self.cfg.get("backend"), "Claude Code"), str(e))
@@ -1601,32 +1829,55 @@ class Engine:
             return ""
         return "".join(b.text for b in resp.content if b.type == "text").strip()
 
+    async def _with_flood_wait(self, call):
+        """call() — запрос к Telegram. Попросил подождать до 5 минут (FloodWait или медленный
+        режим группы) — ждём и повторяем один раз; дольше — ошибка уходит наверх."""
+        try:
+            return await call()
+        except (errors.FloodWaitError, errors.SlowModeWaitError) as e:
+            if e.seconds > 300:
+                raise
+            self.log.warning("%s %s сек — подожду и повторю",
+                             "В группе обсуждения медленный режим:" if isinstance(e, errors.SlowModeWaitError)
+                             else "Telegram просит подождать", e.seconds)
+            await asyncio.sleep(e.seconds + 1)
+            return await call()
+
+    def _send_once(self, p: Pending):
+        file = str(p.image) if p.image else None
+        if p.reply_peer:   # группа обсуждения уже известна из проверки прав
+            return self.client.send_message(p.reply_peer, p.comment, reply_to=p.reply_to, file=file)
+        return self.client.send_message(p.chat_id, p.comment, comment_to=p.post_id, file=file)
+
     async def _send(self, p: Pending) -> bool:
-        for attempt in range(2):
+        try:
             try:
-                await self.client.send_message(
-                    p.chat_id, p.comment, comment_to=p.post_id,
-                    file=str(p.image) if p.image else None,
-                )
-                self.log.info("✅ Комментарий опубликован под #%s (картинка: %s)",
-                         p.post_id, p.image.name if p.image else "нет")
-                self.done_posts.add(p.post_key)
-                with self.done_file.open("a") as f:
-                    f.write(p.post_key + "\n")
-                self._emit("posted")
-                return True
-            except errors.FloodWaitError as e:
-                if attempt == 0 and e.seconds <= 300:
-                    self.log.warning("Telegram просит подождать %s сек — подожду и повторю", e.seconds)
-                    await asyncio.sleep(e.seconds + 1)
-                    continue
-                p.error = f"Telegram ограничил отправку на {e.seconds} сек"
-            except errors.MsgIdInvalidError:
-                p.error = "У поста нет обсуждения (комментарии выключены)"
-            except Exception as e:
-                p.error = f"Не удалось отправить: {e}"
-            self.log.error("Пост #%s: %s", p.post_id, p.error)
-            return False
+                sent = await self._with_flood_wait(lambda: self._send_once(p))
+            except MEDIA_FORBIDDEN:
+                if not p.image:
+                    raise
+                self.log.warning("Пост #%s: в обсуждении нельзя отправлять картинки — публикую без неё",
+                                 p.post_id)
+                p.image = None
+                sent = await self._with_flood_wait(lambda: self._send_once(p))
+        except errors.SlowModeWaitError as e:
+            p.error = f"В группе обсуждения медленный режим: писать можно через {e.seconds} сек"
+        except errors.FloodWaitError as e:
+            p.error = f"Telegram ограничил отправку на {e.seconds} сек"
+        except MEDIA_FORBIDDEN:
+            p.error = "В группе обсуждения запрещено отправлять картинки"
+        except Exception as e:
+            p.error = send_error_text(e)
+        else:
+            p.sent_chat, p.sent_id = sent.chat_id, sent.id
+            self.log.info("✅ Комментарий опубликован под #%s (картинка: %s)",
+                          p.post_id, p.image.name if p.image else "нет")
+            self.done_posts.add(p.post_key)
+            with self.done_file.open("a") as f:
+                f.write(p.post_key + "\n")
+            self._emit("posted")
+            return True
+        self.log.error("Пост #%s: %s", p.post_id, p.error)
         return False
 
     def _cleanup(self, p: Pending):
@@ -1641,13 +1892,30 @@ class Engine:
             if not p or p.busy:
                 return
             p.comment, p.image, p.busy, p.error = text.strip(), image, True, ""
+            await self._publish_pending(p)
+        self._submit(go())
+
+    def postpone(self, key: str, seconds: float):
+        """Добавить seconds ко времени автопубликации."""
+        async def go():
+            p = self.pending.get(key)
+            if not p or not p.publish_at:   # уже публикуется или таймера нет
+                return
+            p.publish_at = max(p.publish_at, time.time()) + seconds
+            self.log.info("Пост #%s: публикация отложена, теперь в %s", p.post_id,
+                          time.strftime("%H:%M:%S", time.localtime(p.publish_at)))
             self._emit("pending_update", p)
-            ok = await self._send(p)
-            p.busy = False
-            if ok:
-                self._finish(p, "published")
-            else:
+        self._submit(go())
+
+    def hold_scheduled(self):
+        """Режим сменили на ручное подтверждение — ничего не публиковать самим."""
+        async def go():
+            held = [p for p in self.pending.values() if p.publish_at]
+            for p in held:
+                p.publish_at = 0
                 self._emit("pending_update", p)
+            if held:
+                self.log.info("Ручной режим: сняты с таймера и ждут решения комментариев — %d", len(held))
         self._submit(go())
 
     def regenerate(self, key: str, wish: str = ""):
@@ -1674,7 +1942,8 @@ class Engine:
         async def go():
             p = self.pending.get(key)
             if p and not p.busy:
-                self.log.info("Пост #%s пропущен вручную", p.post_id)
+                self.log.info("Пост #%s: публикация отменена" if p.publish_at else "Пост #%s пропущен вручную",
+                              p.post_id)
                 self._finish(p, "skipped")
         self._submit(go())
 
