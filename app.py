@@ -1846,6 +1846,7 @@ class App(ctk.CTk):
                       command=self.apply_settings).pack(side="right")
         self.settings_msg = ctk.CTkLabel(bottom, text="", text_color=GREEN)
         self.settings_msg.pack(side="right", padx=12)
+        self._settings_msg_job = None
         self.load_settings_form()
 
     def describe_agy(self, st):
@@ -2095,22 +2096,33 @@ class App(ctk.CTk):
             messagebox.showerror("Настройки", "Для моментальной публикации нужна хотя бы одна заготовка")
             return False
 
-        restart_keys = ("api_id", "api_hash", "channels", "session_name", "proxy_mode", "proxy")
-        needs_restart = self.engine.status != "stopped" and any(new[k] != self.cfg[k] for k in restart_keys)
+        # Эти настройки нужны только при подключении к Telegram — на ходу их не сменить
+        restart_keys = {"api_id": "API ID", "api_hash": "API hash", "session_name": "файл сессии",
+                        "proxy_mode": "прокси", "proxy": "прокси"}
+        needs_restart = [] if self.engine.status == "stopped" else list(dict.fromkeys(
+            label for k, label in restart_keys.items() if new[k] != self.cfg[k]))
+        channels_changed = new["channels"] != self.cfg["channels"]
         if new["images_dir"] != self.cfg["images_dir"]:
             self.engine.reset_deck()
         self.cfg.update(new)   # тот же словарь, что у движка — изменения применяются сразу
         self.save()
+        if channels_changed:
+            self.engine.update_channels()
         self.update_channel_menu()
         self.load_settings_form()
         self.render_queue()   # подсказка пустой очереди зависит от режима публикации
         if not silent:
             self.welcome.pack_forget()
-            msg = "Сохранено ✓"
-            if needs_restart:
-                msg += "  Telegram-настройки применятся после перезапуска"
-            self.settings_msg.configure(text=msg)
-            self.after(6000, lambda: self.settings_msg.configure(text=""))
+            if self._settings_msg_job:
+                self.after_cancel(self._settings_msg_job)
+                self._settings_msg_job = None
+            if needs_restart:   # висит до следующего сохранения — легко пропустить
+                self.settings_msg.configure(
+                    text=f"Сохранено ✓  Нужен перезапуск аккаунта («Остановить» → «Запустить»), чтобы применить: "
+                         f"{', '.join(needs_restart)}", text_color=RED)
+            else:
+                self.settings_msg.configure(text="Сохранено ✓", text_color=GREEN)
+                self._settings_msg_job = self.after(6000, lambda: self.settings_msg.configure(text=""))
         return True
 
     # ------------------------------------------------------------------ промпт

@@ -25,7 +25,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -1073,6 +1073,8 @@ class Engine:
         self._manual_seq = itertools.count(2)   # номера повторных вариантов одного поста
         self._phone = ""
         self.channel_names: dict[int, str] = {}
+        self._watched: dict[str, object] = {}   # запись из списка каналов → найденный канал, который слушаем
+        self._channels_lock: asyncio.Lock | None = None
         self.running = False
         self.status = "stopped"
         self.me_name = ""
@@ -1117,6 +1119,7 @@ class Engine:
         cfg = self.cfg
         self._emit("status", "connecting")
         self._gen_lock = asyncio.Lock()
+        self._channels_lock = asyncio.Lock()
         self._dialogs_loaded = False   # новое подключение — список чатов загрузим заново при надобности
         try:
             proxy = telegram_proxy(cfg)
@@ -1266,28 +1269,64 @@ class Engine:
     def _channel_title(ent) -> str:
         return "@" + ent.username if getattr(ent, "username", None) else getattr(ent, "title", "канал")
 
-    async def _after_login(self):
-        cfg = self.cfg
-        me = await self.client.get_me()
-        entities = []
-        self.channel_names = {}
-        for name in channels(cfg):
+    async def _watch_channels(self):
+        """Сверяет слушаемые каналы со списком в настройках. Ищет в Telegram только новые записи,
+        уже найденные берёт из памяти."""
+        old = self._watched
+        self._watched = {}
+        for name in channels(self.cfg):
+            if name in old:
+                self._watched[name] = old[name]
+                continue
             try:
                 ent = await self._resolve_channel(name)
             except Exception as e:
                 self.log.error("Канал %s не найден — пропускаю: %s", channel_label(name), e)
                 continue
-            entities.append(ent)
+            self._watched[name] = ent
             self.channel_names[utils.get_peer_id(ent)] = self._channel_title(ent)
-        if not entities:
-            self.log.error("Ни один канал не найден — проверьте список в «Настройках»")
-            await self._stop()
-            return
-        self.client.add_event_handler(self._on_new_post, events.NewMessage(chats=entities))
-        self.running = True
+        self.client.remove_event_handler(self._on_new_post)
+        if self._watched:
+            self.client.add_event_handler(self._on_new_post,
+                                          events.NewMessage(chats=list(self._watched.values())))
+
+    def _watched_titles(self) -> str:
+        return ", ".join(self._channel_title(e) for e in self._watched.values())
+
+    def update_channels(self):
+        """Список каналов поменяли в настройках — переподписаться без перезапуска."""
+        async def go():
+            async with self._channels_lock:   # ждём, если как раз идёт вход
+                if not self.running:   # не подключены — новый список возьмётся при запуске
+                    return
+                before = {utils.get_peer_id(e) for e in self._watched.values()}
+                await self._watch_channels()
+                after = {utils.get_peer_id(e) for e in self._watched.values()}
+                if before == after:
+                    return
+                if self._watched:
+                    self.log.info("Список каналов обновлён, слушаю: %s", self._watched_titles())
+                else:
+                    self.log.error("Ни один канал не найден — новые посты не придут, "
+                                   "проверьте список в «Настройках»")
+        if self._channels_lock:
+            self._submit(go())
+
+    async def _after_login(self):
+        cfg = self.cfg
+        me = await self.client.get_me()
+        async with self._channels_lock:
+            self._watched = {}
+            self.channel_names = {}
+            await self._watch_channels()
+            if not self._watched:
+                self.log.error("Ни один канал не найден — проверьте список в «Настройках»")
+                await self._stop()
+                return
+            self.running = True
         self._emit("me", me.first_name)
         self._emit("status", "running")
-        self.log.info("Вошли как %s, слушаю каналы: %s", me.first_name, ", ".join(self.channel_names.values()))
+        self.log.info("Вошли как %s, слушаю каналы: %s", me.first_name, self._watched_titles())
         self.log.info("Картинок для комментариев: %d", len(list_images(cfg)))
 
     # --- картинки ---
