@@ -54,6 +54,12 @@ CLEAR_PERIODS = {"Старше дня": 1, "Недели": 7, "Месяца": 30
 CLEAR_UNITS = {"дней": 1, "часов": 1 / 24}
 REPORT_MAX_ROWS = 2000   # больше в таблице не показываем — тормозит; выгрузка берёт все
 ALL_ACCOUNTS, ALL_CHANNELS = "Все аккаунты", "Все каналы"
+# Что попадает в «Копировать отчёт» и «Текст (.txt)» — выбирается в окне «Что включать…»
+REPORT_FIELDS = {"summary": "Заголовок и итоги", "number": "Номер по порядку", "time": "Дата и время",
+                 "channel": "Канал и номер поста", "account": "Аккаунт (если их несколько)",
+                 "post": "Начало поста", "comment": "Текст комментария", "link": "Ссылка на комментарий"}
+REPORT_PRESETS = {"Всё": list(REPORT_FIELDS), "Комментарии и ссылки": ["comment", "link"],
+                  "Только ссылки": ["link"]}
 PASTE_SEP = re.compile(r"^[ \t]*-{3,}[ \t]*$", re.M)   # пасты многострочные — разделяются строкой «---»
 
 log = logging.getLogger("autocomment")
@@ -1786,11 +1792,11 @@ class App(ctk.CTk):
             f = ctk.CTkFrame(au, fg_color="transparent")
             f.grid_columnconfigure(0, minsize=LABEL_W)
             f.grid_columnconfigure(1, weight=1)
-            ctk.CTkLabel(f, text=hint, text_color="gray", justify="left", wraplength=900).grid(
-                row=0, column=0, columnspan=3, sticky="w", padx=14)
+            f.hint = ctk.CTkLabel(f, text=hint, text_color="gray", justify="left", wraplength=900)
+            f.hint.grid(row=0, column=0, columnspan=3, sticky="w", padx=14)
             return f
 
-        dl = sub_au("Нейросеть пишет комментарий, затем случайная пауза — выглядит естественнее")
+        dl = self.delay_frame = sub_au("")   # подсказка — в show_publish_mode, она зависит от нейросети
         field(dl, 1, "delay_min_sec", "Пауза от, сек", width=80)
         field(dl, 2, "delay_max_sec", "Пауза до, сек", width=80)
         ins = sub_au("Под новым постом сразу появляется заготовка — так комментарий окажется среди первых. "
@@ -1801,7 +1807,9 @@ class App(ctk.CTk):
         self.instant_box.grid(row=1, column=1, sticky="ew", padx=4, pady=(5, 12))
         ctk.CTkLabel(ins, text="по одной на строку,\nберётся случайная", text_color="gray",
                      justify="left").grid(row=1, column=2, sticky="nw", padx=10, pady=5)
-        self.publish_frames = {"delayed": dl, "instant": ins}
+        # Без нейросети заготовки не нужны: паста готова сразу
+        ins_pastes = sub_au("Паста публикуется сразу под новым постом — без паузы и без очереди")
+        self.publish_frames = {"delayed": dl, "instant": ins, "instant_pastes": ins_pastes}
 
         fl = section("Стоп-слова",
                      "Посты с этими словами пропускаются без генерации. По одному на строку; "
@@ -1944,9 +1952,17 @@ class App(ctk.CTk):
             self.ai_common.grid_forget()
         else:
             self.ai_common.grid(row=4, column=0, columnspan=3, sticky="ew")
+        self.show_publish_mode()   # подсказки публикации зависят от того, есть ли нейросеть
 
     def show_publish_mode(self):
         current = PUBLISH_MODES.get(self.publish_mode.get(), "delayed")
+        no_ai = BACKENDS.get(self.backend.get()) == "pastes"
+        if current == "instant" and no_ai:
+            current = "instant_pastes"
+        self.delay_frame.hint.configure(text=(
+            ("Паста публикуется" if no_ai else "Нейросеть пишет комментарий, и он публикуется")
+            + " после случайной паузы — так выглядит естественнее. Пока пауза идёт, комментарий виден "
+              "в «Очереди». Пауза 0 — публикуется сразу, без очереди"))
         for key, f in self.publish_frames.items():
             if key == current:
                 f.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 6))
@@ -2183,6 +2199,7 @@ class App(ctk.CTk):
         self.report_stale = True
         self._search_job = None
         self.clear_dlg = None
+        self.fields_dlg = None
 
         top = ctk.CTkFrame(tab, fg_color="transparent")
         top.pack(fill="x")
@@ -2233,6 +2250,8 @@ class App(ctk.CTk):
                       command=self.save_report_text).pack(side="right", padx=(8, 6))
         ctk.CTkButton(bottom, text="Копировать отчёт", width=150,
                       command=self.copy_report_text).pack(side="right")
+        ctk.CTkButton(bottom, text="Что включать…", width=120, fg_color=GRAY, hover_color=GRAY_HOVER,
+                      command=self.report_fields_dialog).pack(side="right", padx=(0, 6))
         ctk.CTkButton(bottom, text="Обновить", width=100, fg_color=GRAY, hover_color=GRAY_HOVER,
                       command=self.load_report).pack(side="right", padx=8)
         ctk.CTkButton(bottom, text="Очистить…", width=100, fg_color=GRAY, hover_color=GRAY_HOVER,
@@ -2404,40 +2423,126 @@ class App(ctk.CTk):
             self.clipboard_append(r.get("comment", ""))
             self.statusbar.configure(text="Комментарий скопирован", text_color="gray")
 
-    def report_text(self, rows: list[dict]) -> str:
+    def report_fields(self) -> set[str]:
+        saved = self.conf.get("report_fields")
+        fields = {f for f in saved if f in REPORT_FIELDS} if saved is not None else set(REPORT_FIELDS)
+        return fields or set(REPORT_FIELDS)
+
+    def report_text(self, rows: list[dict], fields: set[str] | None = None) -> str:
         """Отчёт обычным текстом — чтобы переслать: сводка и комментарии по порядку времени.
-        Только опубликованные (удалённые заготовки не в счёт) и без «откуда текст»."""
+        Только опубликованные (удалённые заготовки не в счёт) и без «откуда текст».
+        fields — что включать (ключи REPORT_FIELDS), по умолчанию — выбранное в «Что включать…»."""
+        fields = self.report_fields() if fields is None else fields
         live = [r for r in reversed(rows) if not r.get("deleted")]
-        period = self.rep_period.get()
-        lines = [f"Отчёт о комментариях — {period.lower()}"
-                 + ("" if period in ("Сегодня", "Вчера") else f" (на {datetime.now():%d.%m.%Y})")]
-        if period == "Сегодня":
-            lines[0] += f", {datetime.now():%d.%m.%Y}"
-        elif period == "Вчера":
-            lines[0] += f", {datetime.now() - timedelta(days=1):%d.%m.%Y}"
-        for menu, every, title in ((self.rep_account, ALL_ACCOUNTS, "Аккаунт"),
-                                   (self.rep_channel, ALL_CHANNELS, "Канал")):
-            if menu.get() != every:
-                lines.append(f"{title}: {menu.get()}")
-        posts = len({(r.get("chat_id"), r.get("post_id")) for r in live})
-        lines.append(f"Всего комментариев: {len(live)}, под постами: {posts}")
-        by_chan = Counter(r.get("channel") or "—" for r in live)
-        if len(by_chan) > 1:
-            lines.append("По каналам: " + ", ".join(f"{k} — {v}" for k, v in by_chan.most_common()))
+        lines = []
+        if "summary" in fields:
+            period = self.rep_period.get()
+            lines.append(f"Отчёт о комментариях — {period.lower()}"
+                         + ("" if period in ("Сегодня", "Вчера") else f" (на {datetime.now():%d.%m.%Y})"))
+            if period == "Сегодня":
+                lines[0] += f", {datetime.now():%d.%m.%Y}"
+            elif period == "Вчера":
+                lines[0] += f", {datetime.now() - timedelta(days=1):%d.%m.%Y}"
+            for menu, every, title in ((self.rep_account, ALL_ACCOUNTS, "Аккаунт"),
+                                       (self.rep_channel, ALL_CHANNELS, "Канал")):
+                if menu.get() != every:
+                    lines.append(f"{title}: {menu.get()}")
+            posts = len({(r.get("chat_id"), r.get("post_id")) for r in live})
+            lines.append(f"Всего комментариев: {len(live)}, под постами: {posts}")
+            by_chan = Counter(r.get("channel") or "—" for r in live)
+            if len(by_chan) > 1:
+                lines.append("По каналам: " + ", ".join(f"{k} — {v}" for k, v in by_chan.most_common()))
         many_accounts = len({r.get("profile_name") for r in live}) > 1
+        entries = []
         for i, r in enumerate(live, 1):
-            t = datetime.fromisoformat(r["time"]).strftime("%d.%m %H:%M")
-            head = f"{i}. {t} · {r.get('channel', '')} · пост #{r.get('post_id', '')}"
-            if many_accounts:
-                head += f" · {r.get('profile_name', '')}"
+            head = []
+            if "time" in fields:
+                head.append(datetime.fromisoformat(r["time"]).strftime("%d.%m %H:%M"))
+            if "channel" in fields:
+                head.append(f"{r.get('channel', '')} · пост #{r.get('post_id', '')}")
+            if "account" in fields and many_accounts:
+                head.append(r.get("profile_name", ""))
+            entry = [" · ".join(head)] if head else []
             post = " ".join((r.get("post_text") or "").split())
-            lines += ["", head]
-            if post:
-                lines.append(f"Пост: {post[:120]}{'…' if len(post) > 120 else ''}")
-            lines.append(r.get("comment", ""))
-            if r.get("link"):
-                lines.append(r["link"])
-        return "\n".join(lines) + "\n"
+            if "post" in fields and post:
+                entry.append(f"Пост: {post[:120]}{'…' if len(post) > 120 else ''}")
+            if "comment" in fields:
+                entry.append(r.get("comment", ""))
+            if "link" in fields and r.get("link"):
+                entry.append(r["link"])
+            if not entry:   # например, «только ссылки», а у записи ссылки нет
+                continue
+            if "number" in fields:
+                entry[0] = f"{i}. {entry[0]}"
+            entries.append("\n".join(entry))
+        # По строке на запись (например, одни ссылки) — сплошным списком, иначе записи через пустую строку
+        compact = all("\n" not in e for e in entries)
+        body = ("\n" if compact else "\n\n").join(entries)
+        return "\n\n".join(x for x in ("\n".join(lines), body) if x) + "\n"
+
+    def report_fields_dialog(self):
+        """Окно «Что включать»: галочки, готовые наборы и пример того, что получится."""
+        if self.fields_dlg and self.fields_dlg.winfo_exists():
+            self.fields_dlg.lift()
+            self.fields_dlg.focus()
+            return
+        dlg = self.fields_dlg = ctk.CTkToplevel(self)
+        dlg.title("Что включать в отчёт")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        ctk.CTkLabel(dlg, anchor="w", justify="left", wraplength=520, text=(
+            "Для «Копировать отчёт» и «Текст (.txt)». Excel (CSV) выгружает всё.")).pack(
+            fill="x", padx=20, pady=(18, 8))
+        presets = ctk.CTkFrame(dlg, fg_color="transparent")
+        presets.pack(fill="x", padx=20)
+        ctk.CTkLabel(presets, text="Готовые наборы:").pack(side="left")
+        boxes = ctk.CTkFrame(dlg, fg_color="transparent")
+        boxes.pack(fill="x", padx=20, pady=(10, 0))
+        chosen = self.report_fields()
+        vars_ = {}
+        for i, (key, title) in enumerate(REPORT_FIELDS.items()):
+            v = vars_[key] = ctk.BooleanVar(dlg, key in chosen)
+            ctk.CTkCheckBox(boxes, text=title, variable=v, command=lambda: update()).grid(
+                row=i // 2, column=i % 2, sticky="w", padx=(0, 24), pady=3)
+        ctk.CTkLabel(dlg, text="Пример (первые записи текущего отчёта):", anchor="w",
+                     text_color="gray").pack(fill="x", padx=20, pady=(12, 2))
+        preview = ctk.CTkTextbox(dlg, width=520, height=180, wrap="word")
+        preview.pack(padx=20)
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(fill="x", padx=20, pady=(10, 18))
+        warn = ctk.CTkLabel(btns, text="", text_color=RED)
+        warn.pack(side="left")
+        ctk.CTkButton(btns, text="Готово", width=110, command=dlg.destroy).pack(side="right")
+
+        def apply_preset(name):
+            for key, v in vars_.items():
+                v.set(key in REPORT_PRESETS[name])
+            update()
+
+        for name in REPORT_PRESETS:
+            ctk.CTkButton(presets, text=name, width=0, fg_color=GRAY, hover_color=GRAY_HOVER,
+                          command=lambda n=name: apply_preset(n)).pack(side="left", padx=(8, 0))
+
+        def update():
+            fields = {k for k, v in vars_.items() if v.get()}
+            preview.configure(state="normal")
+            preview.delete("1.0", "end")
+            if not fields - {"summary", "number"}:   # одни номера или итоги без записей — пусто
+                warn.configure(text="Выберите, что выводить по каждому комментарию")
+                preview.configure(state="disabled")
+                return
+            warn.configure(text="")
+            self.conf["report_fields"] = [k for k in REPORT_FIELDS if k in fields]
+            self.save()
+            if self.report_rows:   # начало настоящего отчёта — с теми же итогами и номерами
+                text = self.report_text(self.report_rows, fields)
+                cut = text[:1200].rsplit("\n", 1)[0] + "\n…" if len(text) > 1200 else text
+            else:
+                cut = "За выбранный период комментариев нет — пример появится, когда они будут"
+            preview.insert("1.0", cut)
+            preview.configure(state="disabled")
+
+        update()
 
     def copy_report_text(self):
         rows = self.report_rows

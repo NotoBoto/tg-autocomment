@@ -25,7 +25,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -123,7 +123,7 @@ MEDIA_FORBIDDEN = (errors.ChatSendMediaForbiddenError, errors.ChatSendPhotosForb
 
 # ---------- настройки ----------
 # config.json: {"profiles": [профиль, …], "current": id профиля, открытого в окне,
-#               "close_to_tray": bool, "auto_update": bool}.
+#               "close_to_tray": bool, "auto_update": bool, "report_fields": [str] | None}.
 # Профиль — один аккаунт Telegram со всеми своими настройками (ключи из DEFAULTS + "id").
 
 def load_config() -> dict:
@@ -142,6 +142,8 @@ def load_config() -> dict:
     return {"profiles": profiles, "current": data.get("current") if data.get("current") in ids else ids[0],
             "close_to_tray": data.get("close_to_tray", True),   # крестик прячет окно в трей
             "auto_update": data.get("auto_update", True),       # ставить новые версии без вопросов
+            # что включать в текстовый отчёт (ключи REPORT_FIELDS в app.py); None — всё
+            "report_fields": data.get("report_fields"),
             # id профилей, работавших перед автообновлением, — их и запустить после него
             "resume_profiles": data.get("resume_profiles", [])}
 
@@ -1631,6 +1633,13 @@ class Engine:
             delay = 0   # «Моментально» без нейросети: паста уже готова
         else:
             delay = random.randint(cfg["delay_min_sec"], max(cfg["delay_min_sec"], cfg["delay_max_sec"]))
+        if delay <= 0:   # ждать нечего — сразу публикуем, не мелькая в очереди
+            if await self._send(p):
+                self._cleanup(p)
+            else:   # не ушёл — в очередь с ошибкой: повторить или пропустить решит человек
+                self.pending[key] = p
+                self._emit("pending", p)
+            return
         p.publish_at = time.time() + delay
         self.pending[key] = p
         self._emit("pending", p)
