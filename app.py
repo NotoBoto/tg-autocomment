@@ -1040,9 +1040,6 @@ class App(ctk.CTk):
         self.mode = ctk.CTkSegmentedButton(bar, values=[MODE_CONFIRM, MODE_AUTO],
                                            command=self.on_mode)
         self.mode.pack(side="left")
-        self.see_sw = ctk.CTkSwitch(bar, text="Нейронка смотрит картинки поста",
-                                    command=self.on_see_images)
-        self.see_sw.pack(side="left", padx=20)
         self.latest_btn = ctk.CTkButton(bar, text="Взять последний пост канала", width=200,
                                         fg_color=GRAY, hover_color=GRAY_HOVER,
                                         command=self.take_latest)
@@ -1053,10 +1050,8 @@ class App(ctk.CTk):
         self.update_channel_menu()
 
     def load_header_switches(self):
-        """Режим и «смотрит картинки» — настройки открытого профиля."""
+        """Режим — настройка открытого профиля."""
         self.mode.set(MODE_CONFIRM if self.cfg["confirm_before_post"] else MODE_AUTO)
-        self.see_sw.select() if self.cfg["send_post_images"] else self.see_sw.deselect()
-        self.see_sw.configure(state="disabled" if self.cfg.get("backend") == "pastes" else "normal")
 
     def render_status(self):
         """Общий статус по всем аккаунтам: самый «требующий внимания» из их статусов."""
@@ -1154,10 +1149,6 @@ class App(ctk.CTk):
             self.engine.hold_scheduled()   # «подтверждать вручную» — значит, сами больше ничего не публикуем
         log.info("Режим%s: %s", f" «{self.cfg['name']}»" if len(self.engines) > 1 else "", value.lower())
         self.render_queue()
-
-    def on_see_images(self):
-        self.cfg["send_post_images"] = bool(self.see_sw.get())
-        self.save()
 
     def take_latest(self):
         self.tabs.set("Очередь")
@@ -1752,8 +1743,14 @@ class App(ctk.CTk):
         self.backend_frames = {"claude_code": cc, "api": api, "gemini_cli": gc, "gemini_api": ga,
                                "codex": cx, "openai_api": oa, "openai_compat": lm, "pastes": ps}
 
-        field(ai, 4, "max_post_images", "Сколько картинок поста показывать", "если включено «смотрит картинки»", width=80)
-        field(ai, 5, "claude_timeout_sec", "Таймаут ответа, сек", width=80)
+        # Общее для всех нейросетей — без нейросети не нужно, прячется в show_backend
+        self.ai_common = ctk.CTkFrame(ai, fg_color="transparent")
+        self.ai_common.grid_columnconfigure(0, minsize=LABEL_W)
+        self.see_sw = ctk.CTkSwitch(self.ai_common, text="Нейронка смотрит картинки поста")
+        self.see_sw.grid(row=0, column=0, columnspan=3, sticky="w", padx=14, pady=(8, 4))
+        field(self.ai_common, 1, "max_post_images", "Сколько картинок поста показывать",
+              "если включено «смотрит картинки»", width=80)
+        field(self.ai_common, 2, "claude_timeout_sec", "Таймаут ответа, сек", width=80)
         ctk.CTkFrame(ai, height=8, fg_color="transparent").grid(row=6, column=0)
 
         im = section("Картинки к комментариям",
@@ -1942,6 +1939,10 @@ class App(ctk.CTk):
                 f.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
             else:
                 f.grid_forget()
+        if current == "pastes":
+            self.ai_common.grid_forget()
+        else:
+            self.ai_common.grid(row=4, column=0, columnspan=3, sticky="ew")
 
     def show_publish_mode(self):
         current = PUBLISH_MODES.get(self.publish_mode.get(), "delayed")
@@ -1974,6 +1975,7 @@ class App(ctk.CTk):
         self.compat_model.set(c.get("compat_model") or "")
         self.backend.set(next(k for k, v in BACKENDS.items() if v == c.get("backend", "claude_code")))
         self.show_backend()
+        self.see_sw.select() if c["send_post_images"] else self.see_sw.deselect()
         self.update_price()
         self.chance.delete(0, "end")
         self.chance.insert(0, f"{float(c['attach_image_chance']) * 100:g}")
@@ -2054,6 +2056,7 @@ class App(ctk.CTk):
         new["images_dir"] = f["images_dir"] or "images"
         new["model"] = self.model.get() or "sonnet"
         new["backend"] = BACKENDS.get(self.backend.get(), "claude_code")
+        new["send_post_images"] = bool(self.see_sw.get())
         new["api_key"] = f["api_key"]
         new["api_model"] = self.api_model.get()
         new["gemini_api_key"] = f["gemini_api_key"]
@@ -2100,7 +2103,6 @@ class App(ctk.CTk):
         self.save()
         self.update_channel_menu()
         self.load_settings_form()
-        self.load_header_switches()   # «смотрит картинки» недоступно без нейросети
         self.render_queue()   # подсказка пустой очереди зависит от режима публикации
         if not silent:
             self.welcome.pack_forget()
