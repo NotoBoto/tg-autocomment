@@ -25,7 +25,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -37,6 +37,7 @@ BASE.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = BASE / "config.json"
 LEGACY_DONE_FILE = BASE / "done_posts.txt"   # до профилей был один общий файл
 MEDIA_DIR = BASE / "_post_media"
+REPORT_FILE = BASE / "comments.jsonl"   # отчёт: все опубликованные комментарии всех профилей
 
 IMAGE_EXT = {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".gif", ".bmp", ".mp4"}
 MODELS = ["sonnet", "opus", "haiku"]          # для Claude Code
@@ -61,6 +62,7 @@ DEFAULTS = {
     "proxy": "",                   # для custom: socks5://…, http://… или ссылка MTProxy
     "channels": [],                # каналы, за которыми следим
     "backend": "claude_code",      # claude_code | api (Anthropic) | gemini_cli (Antigravity) | gemini_api | codex | openai_api | openai_compat
+                                   # | pastes — без нейросети, случайная паста из списка
     "model": "sonnet",
     "api_key": "",
     "api_model": "claude-opus-5-5",
@@ -82,6 +84,7 @@ DEFAULTS = {
     "publish_mode": "delayed",     # автоматический режим: delayed — пауза и комментарий | instant — сразу
                                    # заготовка, потом её текст заменяется сгенерированным
     "instant_comments": ["Интересно", "О, любопытно", "Хм", "Ого"],
+    "pastes": [],                  # готовые комментарии для режима без нейросети (могут быть многострочными)
     "skip_keywords": ["погиб", "умер", "скончал", "теракт", "катастроф",
                       "траур", "соболезн", "жертв", "пожар", "убит"],
     "claude_timeout_sec": 120,
@@ -104,11 +107,15 @@ SEND_ERRORS = {
     errors.ChatRestrictedError: "Группа обсуждения ограничена Telegram",
     errors.ChatSendPlainForbiddenError: "В группе обсуждения нельзя писать без картинки",
     errors.FrozenMethodInvalidError: "Telegram заморозил аккаунт — подробности у @SpamBot",
+    errors.MediaCaptionTooLongError: "Комментарий длиннее 1024 символов — в подпись к картинке не помещается",
+    errors.MessageTooLongError: "Комментарий длиннее 4096 символов — Telegram такие не принимает",
 }
 
 
 def send_error_text(e: Exception) -> str:
     return next((text for cls, text in SEND_ERRORS.items() if isinstance(e, cls)), f"Не удалось отправить: {e}")
+CAPTION_LIMIT = 1024   # подпись к картинке; обычное сообщение — до MESSAGE_LIMIT
+MESSAGE_LIMIT = 4096
 # Писать можно, а прикладывать картинки нет — тогда комментарий уходит без картинки
 MEDIA_FORBIDDEN = (errors.ChatSendMediaForbiddenError, errors.ChatSendPhotosForbiddenError,
                    errors.ChatSendVideosForbiddenError, errors.ChatSendGifsForbiddenError)
@@ -359,7 +366,11 @@ def validate(cfg) -> list[str]:
             problems.append("Не указаны API ID и API Hash (с my.telegram.org)")
     if not channels(cfg):
         problems.append("Не указан ни один канал")
-    if (cfg.get("publish_mode") == "instant" and not cfg.get("confirm_before_post", True)
+    backend = cfg.get("backend")
+    if backend == "pastes":
+        if not cfg.get("pastes"):
+            problems.append("Выбран режим без нейросети, но список паст пуст — «Настройки» → «Нейросеть»")
+    elif (cfg.get("publish_mode") == "instant" and not cfg.get("confirm_before_post", True)
             and not cfg.get("instant_comments")):
         problems.append("Выбрана моментальная публикация, но нет заготовок — "
                         "«Настройки» → «Автоматический режим»")
@@ -369,10 +380,11 @@ def validate(cfg) -> list[str]:
         telegram_proxy(cfg)
     except ValueError as e:
         problems.append(f"Прокси: {e}")
+    if backend == "pastes":   # промпт и нейросеть не нужны
+        return problems
     p = prompt_path(cfg)
     if not p.exists() or not p.read_text(encoding="utf-8").strip():
         problems.append("Промпт пустой — заполните вкладку «Промпт»")
-    backend = cfg.get("backend")
     if backend == "api":
         if not api_key(cfg):
             problems.append("Не указан API-ключ Anthropic — «Настройки» → «Нейросеть»")
@@ -524,7 +536,7 @@ def set_autostart(on: bool):
 
 BACKEND_NAMES = {"claude_code": "Claude Code", "api": "Claude API", "gemini_cli": "Antigravity",
                  "gemini_api": "Gemini API", "codex": "Codex", "openai_api": "OpenAI API",
-                 "openai_compat": "Своя модель"}
+                 "openai_compat": "Своя модель", "pastes": "Пасты"}
 
 # Так сервисы отвечают на запрос из страны, где они не работают
 REGION_MARKERS = ("not currently available in your location", "location is not supported",
@@ -862,6 +874,8 @@ class Pending:
     busy: bool = False       # идёт генерация/отправка
     publish_at: float = 0.0  # автопубликация по таймеру: когда (time.time()); 0 — ждёт решения человека
     error: str = ""
+    source: str = ""         # откуда текст — для отчёта: имя нейросети, «паста», «заготовка»
+    generated: str = ""      # текст, выданный программой: отличается от comment — значит, правили вручную
 
     @property
     def uid(self) -> str:
@@ -872,6 +886,126 @@ class Pending:
     def post_key(self) -> str:
         """Сам пост — «чат:пост»: по нему помним, под какими постами уже есть комментарий."""
         return f"{self.chat_id}:{self.post_id}"
+
+
+# ---------- отчёт об опубликованных комментариях ----------
+# comments.jsonl — по строке на событие, файл только дописывается:
+#   {"type": "sent", "id": "<чат>:<сообщение>", ...} — комментарий опубликован;
+#   {"type": "edited", "id": …, "comment": …}       — заготовку заменили сгенерированным текстом;
+#   {"type": "deleted", "id": …, "reason": …}       — заготовку удалили (нейросеть ответила SKIP).
+
+_report_lock = threading.Lock()   # пишут движки всех профилей, каждый из своего потока
+_report_gen = 0                   # растёт при каждой очистке — ReportReader тогда читает файл заново
+
+
+def post_link(channel: str, chat_id: int, post_id: int, comment_id: int = 0) -> str:
+    """Ссылка на пост (и на комментарий под ним) — открывается в Telegram."""
+    if channel.startswith("@"):
+        link = f"https://t.me/{channel[1:]}/{post_id}"
+    else:   # закрытый канал: -100<id> → t.me/c/<id>
+        link = f"https://t.me/c/{str(chat_id).removeprefix('-100')}/{post_id}"
+    return link + (f"?comment={comment_id}" if comment_id else "")
+
+
+def report_append(rec: dict):
+    with _report_lock, REPORT_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def parse_report_line(line: str) -> dict | None:
+    """Запись отчёта или None — если строка оборвана при сбое, поправлена руками или непонятна."""
+    try:
+        r = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(r, dict) or not isinstance(r.get("id"), str):
+        return None
+    kind = r.get("type")
+    if kind == "sent":
+        try:
+            datetime.fromisoformat(r["time"])   # дальше время разбирается без проверок
+        except (KeyError, TypeError, ValueError):
+            return None
+        r.setdefault("comment", "")
+    elif kind == "edited":
+        if not isinstance(r.get("comment"), str):
+            return None
+    elif kind != "deleted":
+        return None
+    return r
+
+
+def _apply_report(recs: dict[str, dict], r: dict | None):
+    """Учесть запись: новый комментарий — в recs, замена или удаление заготовки — в его запись."""
+    if r is None:
+        return
+    if r["type"] == "sent":
+        recs[r["id"]] = r
+    elif (cur := recs.get(r["id"])) is not None:
+        if r["type"] == "edited":
+            cur["placeholder"] = cur["comment"]
+            cur["comment"] = r["comment"]
+            cur["source"] = r.get("source") or cur.get("source", "")
+        else:
+            cur["deleted"] = r.get("reason") or "удалён"
+
+
+class ReportReader:
+    """Отчёт для окна: каждый load() разбирает только строки, дописанные с прошлого раза, —
+    файл за месяцы работы большой, а обновляется после каждого комментария."""
+
+    def __init__(self):
+        self._recs: dict[str, dict] = {}
+        self._pos = 0
+        self._gen = -1
+
+    def load(self) -> list[dict]:
+        """Опубликованные комментарии (в порядке записи); замены и удаления заготовок учтены."""
+        with _report_lock:
+            if self._gen != _report_gen:   # отчёт очищали — читаем с начала
+                self._recs, self._pos, self._gen = {}, 0, _report_gen
+            try:
+                with REPORT_FILE.open("rb") as f:
+                    f.seek(self._pos)
+                    data = f.read()
+            except FileNotFoundError:
+                data = b""
+        end = data.rfind(b"\n") + 1   # недописанная последняя строка подождёт следующего раза
+        self._pos += end
+        for line in data[:end].decode("utf-8", "replace").splitlines():
+            _apply_report(self._recs, parse_report_line(line))
+        return list(self._recs.values())
+
+
+def read_report() -> list[dict]:
+    return ReportReader().load()
+
+
+def clear_report(before: datetime | None = None) -> int:
+    """Удаляет из отчёта комментарии, опубликованные раньше before (None — все). Возвращает их число.
+    Битые строки при этом выбрасываются."""
+    global _report_gen
+    with _report_lock:
+        if not REPORT_FILE.exists():
+            return 0
+        keep, kept_ids, removed = [], set(), 0
+        for line in REPORT_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            r = parse_report_line(line)
+            if r is None:
+                continue
+            if r["type"] == "sent":
+                if before is None or datetime.fromisoformat(r["time"]) < before:
+                    removed += 1
+                    continue
+                kept_ids.add(r["id"])
+            elif r["id"] not in kept_ids:   # замена или удаление заготовки из удалённой записи
+                continue
+            keep.append(line)
+        tmp = REPORT_FILE.with_suffix(".tmp")
+        tmp.write_text("".join(x + "\n" for x in keep), encoding="utf-8")
+        tmp.replace(REPORT_FILE)   # целиком или никак: сбой на середине не испортит отчёт
+        _report_gen += 1
+    return removed
 
 
 # ---------- движок ----------
@@ -901,6 +1035,7 @@ class Engine:
       ("pending_update", Pending)
       ("pending_done", (key, result))  published / skipped
       ("posted", None)                 счётчик опубликованных
+      ("report", None)                 в отчёт (comments.jsonl) добавлена запись
     """
 
     def __init__(self, cfg: dict):
@@ -922,6 +1057,8 @@ class Engine:
         self.pending: dict[str, Pending] = {}
         self.done_posts = set(self.done_file.read_text().split()) if self.done_file.exists() else set()
         self._image_bag: list[Path] = []
+        self._paste_bag: list[str] = []
+        self._last_paste = ""
         self._seen_groups: dict[int, None] = {}   # альбомы, уже взятые в работу (по порядку — для чистки)
         self._gen_lock: asyncio.Lock | None = None
         self._api_client = None
@@ -1167,6 +1304,33 @@ class Engine:
     def reset_deck(self):
         self._image_bag = []
 
+    # --- пасты (режим без нейросети) ---
+
+    @property
+    def no_ai(self) -> bool:
+        return self.cfg.get("backend") == "pastes"
+
+    def pick_paste(self, avoid: str = "") -> str:
+        """Как с картинками: колода — каждая паста по разу, потом новый круг.
+        avoid — паста, которую не брать подряд (по умолчанию — последняя выданная)."""
+        avoid = avoid or self._last_paste
+        pastes = [x for x in self.cfg.get("pastes") or [] if x.strip()]
+        if not pastes:
+            raise RuntimeError("список паст пуст — «Настройки» → «Нейросеть»")
+        # Список могли поменять в настройках — удалённые пасты из колоды убираем
+        keep = set(pastes)
+        bag = [x for x in self._paste_bag if x in keep]
+        if not bag or (bag == [avoid] and len(keep) > 1):   # новый круг
+            bag = list(pastes)
+            random.shuffle(bag)
+        # Одна и та же паста дважды подряд выглядит как спам — на стыке кругов и при «Другой пасте»
+        if bag[-1] == avoid and len(bag) > 1:
+            i = next((i for i, x in enumerate(bag) if x != avoid), 0)
+            bag[i], bag[-1] = bag[-1], bag[i]
+        self._paste_bag = bag
+        self._last_paste = bag.pop()
+        return self._last_paste
+
     # --- обработка постов ---
 
     async def _collect_post(self, msg, wait=True):
@@ -1293,9 +1457,10 @@ class Engine:
         chan = self.channel_names.get(msg.chat_id, "")
         self.log.info("Новый пост %s #%s: %s", chan, post_id, post_text[:80].replace("\n", " "))
 
-        see_images = cfg.get("send_post_images", False)
+        see_images = cfg.get("send_post_images", False) and not self.no_ai
         has_media = any(m.photo or m.video or m.gif for m in parts)
-        if not post_text.strip() and not (see_images and has_media):
+        # Пасте текст поста не нужен — комментируем и посты из одних картинок/видео
+        if not post_text.strip() and not (has_media and (see_images or self.no_ai)):
             self.log.info("Пост #%s без текста — пропуск", post_id)
             return
         word = self._is_sensitive(post_text)
@@ -1364,14 +1529,16 @@ class Engine:
 
     def _instant(self, confirm: bool) -> bool:
         """Моментальная публикация: только в автоматическом режиме и если есть заготовки
-        (без заготовок — обычная публикация с задержкой)."""
-        return (not confirm and self.cfg.get("publish_mode") == "instant"
+        (без заготовок — обычная публикация с задержкой). Без нейросети заготовки не нужны:
+        паста готова сразу и уходит обычным путём, только без паузы (см. _comment_on)."""
+        return (not confirm and not self.no_ai and self.cfg.get("publish_mode") == "instant"
                 and bool(self.cfg.get("instant_comments")))
 
     async def _comment_on(self, p: Pending, parts, confirm: bool, instant: bool, with_images: bool):
         cfg, post_id = self.cfg, p.post_id
         if instant:
-            p.comment = random.choice(cfg["instant_comments"])
+            p.comment = p.generated = random.choice(cfg["instant_comments"])
+            p.source = "заготовка"
             p.image = self.pick_image()
             self.log.info("Пост #%s: сразу публикую заготовку «%s», настоящий комментарий заменит её",
                           post_id, p.comment)
@@ -1396,6 +1563,8 @@ class Engine:
 
         try:
             p.comment = await self._generate(post_text, p.post_images) or ""
+            if p.comment:
+                p.source, p.generated = self.source_name(), p.comment
         except Exception as e:
             p.error = self._ai_error(e)
             self.log.error("%s", p.error)
@@ -1419,7 +1588,10 @@ class Engine:
             return
         # Пауза перед публикацией — в очереди с таймером: там видно, когда уйдёт, можно отложить
         # или опубликовать сразу
-        delay = random.randint(cfg["delay_min_sec"], max(cfg["delay_min_sec"], cfg["delay_max_sec"]))
+        if self.no_ai and cfg.get("publish_mode") == "instant":
+            delay = 0   # «Моментально» без нейросети: паста уже готова
+        else:
+            delay = random.randint(cfg["delay_min_sec"], max(cfg["delay_min_sec"], cfg["delay_max_sec"]))
         p.publish_at = time.time() + delay
         self.pending[key] = p
         self._emit("pending", p)
@@ -1470,6 +1642,8 @@ class Engine:
             try:
                 await self.client.delete_messages(p.sent_chat, [p.sent_id])
                 self.log.info("Пост #%s: модель решила пропустить (SKIP) — заготовка удалена", p.post_id)
+                self._report({"type": "deleted", "id": f"{p.sent_chat}:{p.sent_id}",
+                              "reason": "удалена: нейросеть ответила SKIP"})
             except Exception as e:
                 self.log.error("Пост #%s: модель ответила SKIP, но заготовку удалить не удалось: %s",
                                p.post_id, e)
@@ -1477,6 +1651,8 @@ class Engine:
         try:
             await self._with_flood_wait(lambda: self.client.edit_message(p.sent_chat, p.sent_id, text))
             self.log.info("✏️ Заготовка под #%s заменена сгенерированным комментарием", p.post_id)
+            self._report({"type": "edited", "id": f"{p.sent_chat}:{p.sent_id}", "comment": text,
+                          "source": self.source_name()})
             return
         except errors.MessageNotModifiedError:
             return
@@ -1490,10 +1666,16 @@ class Engine:
             err = str(e)
         self.log.error("Пост #%s: заготовку заменить не удалось (%s)", p.post_id, err)
 
+    def source_name(self) -> str:
+        return "паста" if self.no_ai else BACKEND_NAMES.get(self.cfg.get("backend"), "Claude Code")
+
     def _ai_error(self, e: Exception) -> str:
         return explain_ai_error(BACKEND_NAMES.get(self.cfg.get("backend"), "Claude Code"), str(e))
 
-    async def _generate(self, post_text: str, images: list[Path], wish: str = "") -> str | None:
+    async def _generate(self, post_text: str, images: list[Path], wish: str = "",
+                        current: str = "") -> str | None:
+        if self.no_ai:   # пожелания пасте не передать — просто другая из колоды, не current
+            return self.pick_paste(avoid=current)
         async with self._gen_lock:   # по одному запросу к нейросети за раз
             system = prompt_path(self.cfg).read_text(encoding="utf-8") + SKIP_RULE
             user_msg = f"Текст поста:\n\n{post_text or '(текста нет, только медиа)'}"
@@ -1850,6 +2032,10 @@ class Engine:
         return self.client.send_message(p.chat_id, p.comment, comment_to=p.post_id, file=file)
 
     async def _send(self, p: Pending) -> bool:
+        if p.image and len(p.comment) > CAPTION_LIMIT and p.plain_ok:
+            self.log.info("Пост #%s: комментарий длиннее %d символов и в подпись к картинке не помещается — "
+                          "публикую без картинки", p.post_id, CAPTION_LIMIT)
+            p.image = None
         try:
             try:
                 sent = await self._with_flood_wait(lambda: self._send_once(p))
@@ -1873,12 +2059,37 @@ class Engine:
             self.log.info("✅ Комментарий опубликован под #%s (картинка: %s)",
                           p.post_id, p.image.name if p.image else "нет")
             self.done_posts.add(p.post_key)
+            self._report_sent(p)
             with self.done_file.open("a") as f:
                 f.write(p.post_key + "\n")
             self._emit("posted")
             return True
         self.log.error("Пост #%s: %s", p.post_id, p.error)
         return False
+
+    def _report_sent(self, p: Pending):
+        # Сравниваем с выданным программой, а не с p.comment: черновик из окна (save_draft)
+        # попадает в p.comment ещё до публикации
+        if not p.generated:   # нейросеть не ответила или ответила SKIP — текст написал человек
+            source = "вручную"
+        else:
+            source = p.source + (" + правка вручную" if p.comment.strip() != p.generated.strip() else "")
+        rec = {"type": "sent", "id": f"{p.sent_chat}:{p.sent_id}",
+               "time": datetime.now().isoformat(timespec="seconds"),
+               "profile": self.cfg["id"], "profile_name": self.cfg["name"], "account": self.me_name,
+               "channel": p.channel or str(p.chat_id), "chat_id": p.chat_id, "post_id": p.post_id,
+               "post_text": p.post_text[:1000], "comment": p.comment, "source": source,
+               "image": p.image.name if p.image else "",
+               "link": post_link(p.channel, p.chat_id, p.post_id, p.sent_id)}
+        self._report(rec)
+
+    def _report(self, rec: dict):
+        try:
+            report_append(rec)
+        except OSError as e:   # отчёт не должен мешать работе
+            self.log.warning("Не удалось записать отчёт: %s", e)
+            return
+        self._emit("report")
 
     def _cleanup(self, p: Pending):
         if p.post_images:
@@ -1926,9 +2137,10 @@ class Engine:
             p.busy, p.error = True, ""
             self._emit("pending_update", p)
             try:
-                text = await self._generate(p.post_text, p.post_images, wish)
+                text = await self._generate(p.post_text, p.post_images, wish, current=p.comment)
                 if text:
-                    p.comment = text
+                    p.comment = p.generated = text
+                    p.source = self.source_name()
                 else:
                     p.error = "Модель ответила SKIP (тяжёлая тема)"
             except Exception as e:

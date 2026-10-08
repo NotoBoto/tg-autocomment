@@ -1,10 +1,12 @@
 """
 Окно автокомментатора. Запуск: start.bat или python app.py
 """
+import csv
 import ctypes
 import logging
 import os
 import queue
+import re
 import shutil
 import socket
 import sys
@@ -12,8 +14,10 @@ import threading
 import time
 import webbrowser
 import zlib
+from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
 import qrcode
@@ -38,11 +42,19 @@ LABEL_W = 270  # ширина колонки подписей в блоке «Н
 BACKENDS = {"Claude Code": "claude_code", "Claude API": "api",
             "Antigravity (Google)": "gemini_cli", "Gemini API": "gemini_api",
             "ChatGPT (Codex)": "codex", "OpenAI API": "openai_api",
-            "Своя модель": "openai_compat"}
+            "Своя модель": "openai_compat", "Без нейросети": "pastes"}
 DEFAULT_MODEL = "(по умолчанию)"
 PROXY_MODES = {"Системный (из VPN)": "system", "Свой": "custom", "Без прокси": "none"}
 MODE_CONFIRM, MODE_AUTO = "Подтверждать вручную", "Публиковать сами"
 PUBLISH_MODES = {"С задержкой": "delayed", "Моментально": "instant"}
+
+REPORT_PERIODS = {"Сегодня": 0, "Вчера": 1, "7 дней": 7, "30 дней": 30, "Всё время": None}
+# Очистка отчёта: удалить записи старше стольких дней; None — свой срок, 0 — все
+CLEAR_PERIODS = {"Старше дня": 1, "Недели": 7, "Месяца": 30, "Своё": None, "Все записи": 0}
+CLEAR_UNITS = {"дней": 1, "часов": 1 / 24}
+REPORT_MAX_ROWS = 2000   # больше в таблице не показываем — тормозит; выгрузка берёт все
+ALL_ACCOUNTS, ALL_CHANNELS = "Все аккаунты", "Все каналы"
+PASTE_SEP = re.compile(r"^[ \t]*-{3,}[ \t]*$", re.M)   # пасты многострочные — разделяются строкой «---»
 
 log = logging.getLogger("autocomment")
 
@@ -582,7 +594,9 @@ class App(ctk.CTk):
         self._build_queue_tab(self.tabs.add("Очередь"))
         self._build_settings_tab(self.tabs.add("Настройки"))
         self._build_prompt_tab(self.tabs.add("Промпт"))
+        self._build_report_tab(self.tabs.add("Отчёт"))
         self._build_log_tab(self.tabs.add("Журнал"))
+        self.tabs.configure(command=self.on_tab)
         for sf in (self.settings_sf, self.list_frame):
             repaint_after_scroll(sf)
         fix_hotkeys_any_layout(self)
@@ -1042,6 +1056,7 @@ class App(ctk.CTk):
         """Режим и «смотрит картинки» — настройки открытого профиля."""
         self.mode.set(MODE_CONFIRM if self.cfg["confirm_before_post"] else MODE_AUTO)
         self.see_sw.select() if self.cfg["send_post_images"] else self.see_sw.deselect()
+        self.see_sw.configure(state="disabled" if self.cfg.get("backend") == "pastes" else "normal")
 
     def render_status(self):
         """Общий статус по всем аккаунтам: самый «требующий внимания» из их статусов."""
@@ -1341,9 +1356,12 @@ class App(ctk.CTk):
                        "Хотите проверить промпт? Нажмите «Взять последний пост канала»\n"
                        "или вставьте ссылку на любой пост в поле сверху.")
             else:
+                no_ai = self.cfg.get("backend") == "pastes"
                 instant = (self.cfg.get("publish_mode") == "instant"
-                           and self.cfg.get("instant_comments"))
-                msg = (("Автоматический режим, моментально: под новым постом сразу появится заготовка,\n"
+                           and (no_ai or self.cfg.get("instant_comments")))
+                msg = (("Автоматический режим, моментально: под новым постом сразу появится случайная паста."
+                        if instant and no_ai else
+                        "Автоматический режим, моментально: под новым постом сразу появится заготовка,\n"
                         "а потом её текст заменится комментарием нейросети." if instant else
                         "Автоматический режим: комментарии публикуются сами после случайной паузы.\n"
                         "Пока пауза идёт, комментарий виден здесь — можно добавить время,\n"
@@ -1419,7 +1437,9 @@ class App(ctk.CTk):
         else:
             self.progress.stop()
             self.progress.grid_forget()
-        if p.busy:
+        if p.busy and self.owner(p).no_ai:
+            self.err_lbl.configure(text="⏳ Подбираю пасту…", text_color="gray")
+        elif p.busy:
             name = core.BACKEND_NAMES.get(self.owner(p).cfg.get("backend"), "Нейросеть")
             self.err_lbl.configure(text=f"⏳ {name} пишет комментарий… (обычно 10–40 секунд)",
                                    text_color="gray")
@@ -1439,6 +1459,9 @@ class App(ctk.CTk):
         for b in (self.publish_btn, self.skip_btn, self.regen_btn, *self.img_btns, *self.sched_btns):
             b.configure(state=st)
         self.comment_box.configure(state=st)
+        no_ai = self.owner(p).no_ai
+        self.wish.grid_remove() if no_ai else self.wish.grid()
+        self.regen_btn.configure(text="↻  Другая паста" if no_ai else "↻  Новый вариант")
         if not p.comment and not p.busy:
             self.publish_btn.configure(state="disabled")
 
@@ -1517,13 +1540,15 @@ class App(ctk.CTk):
         ctk.CTkLabel(self.welcome, justify="left", anchor="w", wraplength=900, text=(
             "👋  Добро пожаловать! Для начала работы:\n"
             "0. В блоке «Нейросеть» выберите способ: Claude Code, Antigravity или ChatGPT (вход в аккаунт, "
-            "кнопка «Установить и войти»), API-ключ Claude/Gemini/OpenAI или свою модель (LM Studio, Ollama)\n"
+            "кнопка «Установить и войти»), API-ключ Claude/Gemini/OpenAI, свою модель (LM Studio, Ollama) "
+            "или «Без нейросети» — тогда программа постит случайные пасты из вашего списка\n"
             + ("1. API ID и API Hash указывать не нужно — в программу встроен свой ключ\n"
                if core.BUILTIN_TELEGRAM_APP else
                "1. Получите API ID и API Hash на my.telegram.org (раздел «API development tools»)\n")
             + 
             "2. Укажите канал, под постами которого нужно комментировать\n"
-            "3. Заполните вкладку «Промпт» — инструкцию для нейросети\n"
+            "3. Заполните вкладку «Промпт» — инструкцию для нейросети (для «Без нейросети» промпт не нужен: "
+            "пасты вводятся тут же, в блоке «Нейросеть»)\n"
             "4. Нажмите «Сохранить», затем «▶ Запустить» — программа предложит войти в Telegram\n"
             "Нужно несколько аккаунтов? «+ Добавить аккаунт» вверху — у каждого свои настройки и промпт"
         )).pack(padx=14, pady=10, anchor="w")
@@ -1710,8 +1735,22 @@ class App(ctk.CTk):
         self.compat_lbl = ctk.CTkLabel(chk, text="", text_color="gray")
         self.compat_lbl.pack(side="left", padx=10)
 
+        # --- без нейросети: случайные пасты из списка ---
+        ps = sub("Нейросеть не нужна: под постом публикуется случайная паста из списка — по очереди в "
+                 "случайном порядке, без повторов, пока не кончится круг. Промпт не используется, "
+                 "«↻ Другая паста» в очереди берёт другую. Длинная паста (больше 1024 символов) уходит без "
+                 "картинки — в подпись она не помещается. Стоп-слова работают как обычно.")
+        ctk.CTkLabel(ps, text="Пасты").grid(row=1, column=0, sticky="nw", padx=14, pady=8)
+        self.pastes_box = ctk.CTkTextbox(ps, height=220, wrap="word")
+        self.pastes_box.grid(row=1, column=1, sticky="ew", padx=4, pady=5)
+        ctk.CTkLabel(ps, text="паста может быть\nв несколько строк;\nмежду пастами —\nстрока ---",
+                     text_color="gray", justify="left").grid(row=1, column=2, sticky="nw", padx=10, pady=5)
+        self.pastes_count = ctk.CTkLabel(ps, text="", text_color="gray")
+        self.pastes_count.grid(row=2, column=1, sticky="w", padx=4)
+        self.pastes_box.bind("<KeyRelease>", lambda e: self.update_pastes_count())
+
         self.backend_frames = {"claude_code": cc, "api": api, "gemini_cli": gc, "gemini_api": ga,
-                               "codex": cx, "openai_api": oa, "openai_compat": lm}
+                               "codex": cx, "openai_api": oa, "openai_compat": lm, "pastes": ps}
 
         field(ai, 4, "max_post_images", "Сколько картинок поста показывать", "если включено «смотрит картинки»", width=80)
         field(ai, 5, "claude_timeout_sec", "Таймаут ответа, сек", width=80)
@@ -1944,7 +1983,28 @@ class App(ctk.CTk):
         self.show_publish_mode()
         self.instant_box.delete("1.0", "end")
         self.instant_box.insert("1.0", "\n".join(c["instant_comments"]))
+        self.pastes_box.delete("1.0", "end")
+        self.pastes_box.insert("1.0", "\n---\n".join(c.get("pastes", [])))
+        self.update_pastes_count()
         self.update_img_count()
+
+    def read_pastes(self) -> list[str]:
+        """Пасты из поля; по краям убираем только пустые строки — отступы внутри пасты сохраняются."""
+        pastes = []
+        for chunk in PASTE_SEP.split(self.pastes_box.get("1.0", "end-1c")):
+            lines = [line.rstrip() for line in chunk.splitlines()]
+            while lines and not lines[0].strip():
+                lines.pop(0)
+            while lines and not lines[-1].strip():
+                lines.pop()
+            if lines:
+                pastes.append("\n".join(lines))
+        return pastes
+
+    def update_pastes_count(self):
+        n = len(self.read_pastes())
+        self.pastes_count.configure(text=f"Паст: {n}" if n else "Список пуст — добавьте хотя бы одну пасту",
+                                    text_color="gray" if n else RED)
 
     def update_img_count(self):
         n = len(core.list_images(self.cfg))
@@ -2018,7 +2078,17 @@ class App(ctk.CTk):
         new["skip_keywords"] = [w.strip() for w in self.keywords.get("1.0", "end").splitlines() if w.strip()]
         new["publish_mode"] = PUBLISH_MODES.get(self.publish_mode.get(), "delayed")
         new["instant_comments"] = [w.strip() for w in self.instant_box.get("1.0", "end").splitlines() if w.strip()]
-        if new["publish_mode"] == "instant" and not new["instant_comments"] and not new["confirm_before_post"]:
+        new["pastes"] = self.read_pastes()
+        if new["backend"] == "pastes" and not new["pastes"]:
+            messagebox.showerror("Настройки", "Для режима без нейросети нужна хотя бы одна паста")
+            return False
+        too_long = [i for i, x in enumerate(new["pastes"], 1) if len(x) > core.MESSAGE_LIMIT]
+        if too_long:
+            messagebox.showerror("Настройки", f"Telegram не примет комментарий длиннее {core.MESSAGE_LIMIT} "
+                                              f"символов — сократите пасты №{', '.join(map(str, too_long))}")
+            return False
+        if (new["publish_mode"] == "instant" and not new["instant_comments"] and not new["confirm_before_post"]
+                and new["backend"] != "pastes"):
             messagebox.showerror("Настройки", "Для моментальной публикации нужна хотя бы одна заготовка")
             return False
 
@@ -2030,6 +2100,7 @@ class App(ctk.CTk):
         self.save()
         self.update_channel_menu()
         self.load_settings_form()
+        self.load_header_switches()   # «смотрит картинки» недоступно без нейросети
         self.render_queue()   # подсказка пустой очереди зависит от режима публикации
         if not silent:
             self.welcome.pack_forget()
@@ -2087,6 +2158,434 @@ class App(ctk.CTk):
         n = len(self.prompt_box.get("1.0", "end-1c"))
         dirty = "  ·  есть несохранённые изменения" if self.prompt_dirty() else ""
         self.prompt_msg.configure(text=f"{n} символов{dirty}" + (f"  ·  {extra}" if extra else ""))
+
+    # ------------------------------------------------------------------ отчёт
+
+    def _build_report_tab(self, tab):
+        self.report_reader = core.ReportReader()
+        self.report: list[dict] = []        # все записи из comments.jsonl
+        self.report_rows: list[dict] = []   # прошедшие фильтры, новые первыми
+        self.report_by_id: dict[str, dict] = {}   # строки таблицы (iid — id записи) → запись
+        self.report_stale = True
+        self._search_job = None
+        self.clear_dlg = None
+
+        top = ctk.CTkFrame(tab, fg_color="transparent")
+        top.pack(fill="x")
+        self.rep_period = ctk.CTkSegmentedButton(top, values=list(REPORT_PERIODS),
+                                                 command=lambda v: self.render_report())
+        self.rep_period.set("Сегодня")
+        self.rep_period.pack(side="left")
+        self.rep_account = ctk.CTkOptionMenu(top, values=[ALL_ACCOUNTS], width=160,
+                                             command=lambda v: self.render_report())
+        self.rep_account.pack(side="left", padx=(12, 4))
+        self.rep_channel = ctk.CTkOptionMenu(top, values=[ALL_CHANNELS], width=170,
+                                             command=lambda v: self.render_report())
+        self.rep_channel.pack(side="left", padx=4)
+        self.rep_search = ctk.CTkEntry(top, placeholder_text="Поиск по тексту…")
+        self.rep_search.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.rep_search.bind("<KeyRelease>", lambda e: self.search_report_soon())
+
+        self.rep_summary = ctk.CTkLabel(tab, text="", anchor="w", justify="left", wraplength=1040)
+        self.rep_summary.pack(fill="x", pady=(8, 4))
+
+        table = ctk.CTkFrame(tab, fg_color="transparent")
+        table.pack(fill="both", expand=True)
+        cols = {"time": ("Когда", 95), "account": ("Аккаунт", 120), "channel": ("Канал", 150),
+                "post": ("Пост", 60), "source": ("Откуда текст", 190), "comment": ("Комментарий", 380)}
+        self.rep_tree = ttk.Treeview(table, columns=list(cols), show="headings", style="Report.Treeview",
+                                     selectmode="browse")
+        for key, (title, width) in cols.items():
+            self.rep_tree.heading(key, text=title, anchor="w")
+            self.rep_tree.column(key, width=width, minwidth=50, stretch=key == "comment", anchor="w")
+        bar = ctk.CTkScrollbar(table, command=self.rep_tree.yview)
+        self.rep_tree.configure(yscrollcommand=bar.set)
+        self.rep_tree.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        self.rep_tree.bind("<<TreeviewSelect>>", lambda e: self.show_report_detail())
+        self.rep_tree.bind("<Double-1>", lambda e: self.open_report_link())
+
+        # Подробности и кнопки закреплены внизу: при длинной сводке сжимается таблица, а не они
+        self.rep_detail = ctk.CTkTextbox(tab, height=140, wrap="word")
+        self.rep_detail.pack(side="bottom", fill="x", pady=(6, 0), before=table)
+        self.rep_detail.tag_config("head", foreground="gray")
+        self.rep_detail.configure(state="disabled")
+
+        bottom = ctk.CTkFrame(tab, fg_color="transparent")
+        bottom.pack(side="bottom", fill="x", pady=(6, 0), before=self.rep_detail)
+        ctk.CTkButton(bottom, text="Excel (CSV)", width=110,
+                      command=self.export_report).pack(side="right")
+        ctk.CTkButton(bottom, text="Текст (.txt)", width=110,
+                      command=self.save_report_text).pack(side="right", padx=(8, 6))
+        ctk.CTkButton(bottom, text="Копировать отчёт", width=150,
+                      command=self.copy_report_text).pack(side="right")
+        ctk.CTkButton(bottom, text="Обновить", width=100, fg_color=GRAY, hover_color=GRAY_HOVER,
+                      command=self.load_report).pack(side="right", padx=8)
+        ctk.CTkButton(bottom, text="Очистить…", width=100, fg_color=GRAY, hover_color=GRAY_HOVER,
+                      command=self.clear_report).pack(side="right")
+        self.rep_open_btn = ctk.CTkButton(bottom, text="Открыть в Telegram", width=170,
+                                          command=self.open_report_link, state="disabled")
+        self.rep_open_btn.pack(side="left")
+        self.rep_copy_btn = ctk.CTkButton(bottom, text="Копировать комментарий", width=190, fg_color=GRAY,
+                                          hover_color=GRAY_HOVER, command=self.copy_report_comment,
+                                          state="disabled")
+        self.rep_copy_btn.pack(side="left", padx=8)
+        self.style_report()
+
+    def on_tab(self):
+        if self.tabs.get() == "Отчёт":
+            self.style_report()   # тема Windows могла смениться
+            if self.report_stale:
+                self.load_report()
+
+    def search_report_soon(self):
+        """Поиск — когда перестали печатать, а не на каждую букву."""
+        if self._search_job:
+            self.after_cancel(self._search_job)
+        self._search_job = self.after(300, self.render_report)
+
+    def style_report(self):
+        """Таблица — ttk, у неё свои цвета: подстраиваем под светлую/тёмную тему окна."""
+        dark = ctk.get_appearance_mode() == "Dark"
+        bg, fg, head, sel = (("#242424", "#dce4ee", "#333333", "#1f538d") if dark else
+                             ("#ffffff", "#1a1a1a", "#e4e4e4", "#3a7ebf"))
+        scale = self._get_window_scaling()
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("Report.Treeview", background=bg, fieldbackground=bg, foreground=fg,
+                        rowheight=int(24 * scale), borderwidth=0, font=("Segoe UI", 10),
+                        bordercolor=bg, lightcolor=bg, darkcolor=bg)
+        style.configure("Report.Treeview.Heading", background=head, foreground=fg, relief="flat",
+                        font=("Segoe UI", 10, "bold"))
+        style.map("Report.Treeview", background=[("selected", sel)], foreground=[("selected", "white")])
+        style.map("Report.Treeview.Heading", background=[("active", head)])
+        self.rep_tree.tag_configure("deleted", foreground="gray")
+
+    def load_report(self):
+        try:
+            self.report = self.report_reader.load()
+        except OSError as e:
+            log.warning("Не удалось прочитать отчёт: %s", e)
+            self.report = []
+        self.report_stale = False
+        names = sorted({r.get("profile_name", "") for r in self.report} - {""})
+        chans = sorted({r.get("channel", "") for r in self.report} - {""})
+        for menu, every, values in ((self.rep_account, ALL_ACCOUNTS, names),
+                                    (self.rep_channel, ALL_CHANNELS, chans)):
+            menu.configure(values=[every, *values])
+            if menu.get() not in values:
+                menu.set(every)
+        self.render_report()
+
+    def report_filtered(self) -> list[dict]:
+        days = REPORT_PERIODS.get(self.rep_period.get())
+        start = end = None
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        if days == 1:   # «Вчера» — только вчерашний день
+            start, end = today - timedelta(days=1), today
+        elif days is not None:   # «Сегодня» и «N дней» — N календарных дней, считая сегодняшний
+            start = today - timedelta(days=max(days - 1, 0))
+        acc, chan = self.rep_account.get(), self.rep_channel.get()
+        q = self.rep_search.get().strip().lower()
+        rows = []
+        for r in self.report:
+            t = datetime.fromisoformat(r["time"])   # проверено при чтении (core.parse_report_line)
+            if (start and t < start) or (end and t >= end):
+                continue
+            if (acc != ALL_ACCOUNTS and r.get("profile_name") != acc
+                    or chan != ALL_CHANNELS and r.get("channel") != chan):
+                continue
+            if q and q not in f"{r.get('comment', '')}\n{r.get('post_text', '')}".lower():
+                continue
+            rows.append(r)
+        rows.sort(key=lambda r: r["time"], reverse=True)   # новые сверху
+        return rows
+
+    def render_report(self):
+        self._search_job = None
+        rows = self.report_rows = self.report_filtered()
+        tree = self.rep_tree
+        # Таблица обновляется и сама, после каждого комментария, — выбранная строка и прокрутка
+        # не должны слетать, пока человек читает
+        selected, scroll = tree.selection(), tree.yview()[0]
+        tree.delete(*tree.get_children())
+        shown = rows[:REPORT_MAX_ROWS]
+        self.report_by_id = {r["id"]: r for r in shown}
+        for r in shown:
+            t = datetime.fromisoformat(r["time"])
+            when = t.strftime("%H:%M:%S" if t.date() == datetime.now().date() else "%d.%m %H:%M")
+            comment = " ".join(r.get("comment", "").split())
+            if r.get("deleted"):
+                comment = f"[{r['deleted']}] {comment}"
+            tree.insert("", "end", iid=r["id"], tags=("deleted",) if r.get("deleted") else (), values=(
+                when, r.get("profile_name", ""), r.get("channel", ""),
+                f"#{r.get('post_id', '')}", r.get("source", ""), comment[:300]))
+        if selected and tree.exists(selected[0]):
+            tree.selection_set(selected[0])
+        tree.yview_moveto(scroll)
+        summary = self.report_summary(rows)
+        if len(rows) > REPORT_MAX_ROWS:
+            summary += (f"\nВ таблице — последние {REPORT_MAX_ROWS} из {len(rows)}: уточните период или фильтр. "
+                        "Копирование и выгрузка берут все")
+        self.rep_summary.configure(text=summary)
+        self.show_report_detail()
+
+    def report_summary(self, rows: list[dict]) -> str:
+        live = [r for r in rows if not r.get("deleted")]
+        if not rows:
+            return ("За этот период комментариев нет." if self.report else
+                    "Здесь появятся все опубликованные комментарии — сколько, где и какие.")
+        posts = len({(r.get("chat_id"), r.get("post_id")) for r in live})
+        text = f"Опубликовано комментариев: {len(live)}  ·  под постами: {posts}"
+        if len(live) < len(rows):
+            text += f"  ·  удалено заготовок: {len(rows) - len(live)}"
+
+        def top(field):
+            c = Counter(r.get(field) or "—" for r in live)
+            return ",  ".join(f"{k} — {v}" for k, v in c.most_common())
+        text += f"\nПо каналам: {top('channel')}"
+        if len({r.get('profile_name') for r in live}) > 1:
+            text += f"\nПо аккаунтам: {top('profile_name')}"
+        text += f"\nОткуда текст: {top('source')}"
+        return text
+
+    def report_current(self) -> dict | None:
+        sel = self.rep_tree.selection()
+        return self.report_by_id.get(sel[0]) if sel else None
+
+    def show_report_detail(self):
+        r = self.report_current()
+        box = self.rep_detail
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        if r:
+            t = datetime.fromisoformat(r["time"]).strftime("%d.%m.%Y %H:%M:%S")
+            who = r.get("profile_name", "") + (f" ({r['account']})" if r.get("account") else "")
+            head = f"{t}  ·  {who}  ·  {r.get('channel', '')} #{r.get('post_id', '')}  ·  {r.get('source', '')}"
+            if r.get("image"):
+                head += f"  ·  картинка {r['image']}"
+            box.insert("end", head + "\n", "head")
+            if r.get("deleted"):
+                box.insert("end", f"Комментарий {r['deleted']}\n", "head")
+            box.insert("end", "\nКомментарий:\n" + r.get("comment", "") + "\n")
+            if r.get("placeholder"):
+                box.insert("end", f"\nСначала была заготовка: {r['placeholder']}\n", "head")
+            box.insert("end", "\nПост:\n" + (r.get("post_text") or "(текста нет, только медиа)"), "head")
+        else:
+            box.insert("end", "Выберите комментарий в таблице — здесь будет его полный текст и пост. "
+                              "Двойной щелчок открывает комментарий в Telegram.", "head")
+        box.configure(state="disabled")
+        st = "normal" if r else "disabled"
+        self.rep_open_btn.configure(state=st if r and r.get("link") else "disabled")
+        self.rep_copy_btn.configure(state=st)
+
+    def open_report_link(self):
+        r = self.report_current()
+        if r and r.get("link"):
+            webbrowser.open(r["link"])
+
+    def copy_report_comment(self):
+        if r := self.report_current():
+            self.clipboard_clear()
+            self.clipboard_append(r.get("comment", ""))
+            self.statusbar.configure(text="Комментарий скопирован", text_color="gray")
+
+    def report_text(self, rows: list[dict]) -> str:
+        """Отчёт обычным текстом — чтобы переслать: сводка и комментарии по порядку времени.
+        Только опубликованные (удалённые заготовки не в счёт) и без «откуда текст»."""
+        live = [r for r in reversed(rows) if not r.get("deleted")]
+        period = self.rep_period.get()
+        lines = [f"Отчёт о комментариях — {period.lower()}"
+                 + ("" if period in ("Сегодня", "Вчера") else f" (на {datetime.now():%d.%m.%Y})")]
+        if period == "Сегодня":
+            lines[0] += f", {datetime.now():%d.%m.%Y}"
+        elif period == "Вчера":
+            lines[0] += f", {datetime.now() - timedelta(days=1):%d.%m.%Y}"
+        for menu, every, title in ((self.rep_account, ALL_ACCOUNTS, "Аккаунт"),
+                                   (self.rep_channel, ALL_CHANNELS, "Канал")):
+            if menu.get() != every:
+                lines.append(f"{title}: {menu.get()}")
+        posts = len({(r.get("chat_id"), r.get("post_id")) for r in live})
+        lines.append(f"Всего комментариев: {len(live)}, под постами: {posts}")
+        by_chan = Counter(r.get("channel") or "—" for r in live)
+        if len(by_chan) > 1:
+            lines.append("По каналам: " + ", ".join(f"{k} — {v}" for k, v in by_chan.most_common()))
+        many_accounts = len({r.get("profile_name") for r in live}) > 1
+        for i, r in enumerate(live, 1):
+            t = datetime.fromisoformat(r["time"]).strftime("%d.%m %H:%M")
+            head = f"{i}. {t} · {r.get('channel', '')} · пост #{r.get('post_id', '')}"
+            if many_accounts:
+                head += f" · {r.get('profile_name', '')}"
+            post = " ".join((r.get("post_text") or "").split())
+            lines += ["", head]
+            if post:
+                lines.append(f"Пост: {post[:120]}{'…' if len(post) > 120 else ''}")
+            lines.append(r.get("comment", ""))
+            if r.get("link"):
+                lines.append(r["link"])
+        return "\n".join(lines) + "\n"
+
+    def copy_report_text(self):
+        rows = self.report_rows
+        if not rows:
+            messagebox.showinfo("Отчёт", "Нечего копировать — за выбранный период комментариев нет")
+            return
+        text = self.report_text(rows)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        note = ("  ·  длиннее 4096 символов — в одно сообщение Telegram не влезет, лучше «Текст (.txt)»"
+                if len(text) > 4096 else "")
+        self.statusbar.configure(text=f"Отчёт скопирован — вставьте его в сообщение{note}", text_color="gray")
+
+    def save_report_text(self):
+        rows = self.report_rows
+        if not rows:
+            messagebox.showinfo("Отчёт", "Нечего сохранять — за выбранный период комментариев нет")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Сохранить отчёт", defaultextension=".txt", filetypes=[("Текст", "*.txt")],
+            initialfile=f"Комментарии {datetime.now():%Y-%m-%d}.txt")
+        if not path:
+            return
+        try:
+            Path(path).write_text(self.report_text(rows), encoding="utf-8-sig")   # BOM — для Блокнота
+        except OSError as e:
+            messagebox.showerror("Отчёт", f"Не удалось сохранить: {e}")
+            return
+        if messagebox.askyesno("Отчёт", "Отчёт сохранён. Открыть файл?"):
+            open_path(Path(path))
+
+    def clear_report(self):
+        """Окно очистки: удалить записи старше дня, недели, месяца, своего срока — или все."""
+        if self.clear_dlg and self.clear_dlg.winfo_exists():   # уже открыто — повторный щелчок
+            self.clear_dlg.lift()
+            self.clear_dlg.focus()
+            return
+        if not self.report:
+            messagebox.showinfo("Отчёт", "Отчёт и так пуст")
+            return
+        dlg = self.clear_dlg = ctk.CTkToplevel(self)
+        dlg.title("Очистить отчёт")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        ctk.CTkLabel(dlg, text=f"В отчёте записей: {len(self.report)}. Удалить:", anchor="w").pack(
+            fill="x", padx=20, pady=(18, 6))
+        period = ctk.CTkSegmentedButton(dlg, values=list(CLEAR_PERIODS), command=lambda v: update())
+        period.set("Месяца")
+        period.pack(anchor="w", padx=20)
+        own = ctk.CTkFrame(dlg, fg_color="transparent")
+        ctk.CTkLabel(own, text="Старше").pack(side="left")
+        amount_var = ctk.StringVar(dlg, "3")   # trace ловит и ввод, и вставку мышью
+        amount = ctk.CTkEntry(own, width=70, justify="right", textvariable=amount_var)
+        amount.pack(side="left", padx=6)
+        amount_var.trace_add("write", lambda *_: update())
+        unit = ctk.CTkOptionMenu(own, values=list(CLEAR_UNITS), width=90, command=lambda v: update())
+        unit.pack(side="left")
+        info = ctk.CTkLabel(dlg, text="", anchor="w", justify="left", wraplength=440)
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")   # снизу вверх: кнопки, под ними предупреждение
+        btns.pack(side="bottom", fill="x", padx=20, pady=(6, 18))
+        ctk.CTkLabel(dlg, justify="left", wraplength=440, text_color="gray", text=(
+            "Удалённое не вернуть — при необходимости сначала сохраните отчёт в Excel или текстом. "
+            "На комментарии в Telegram очистка не влияет.")).pack(side="bottom", fill="x", padx=20, pady=(12, 0))
+        ctk.CTkButton(btns, text="Отмена", width=90, fg_color=GRAY, hover_color=GRAY_HOVER,
+                      command=dlg.destroy).pack(side="right")
+        delete_btn = ctk.CTkButton(btns, text="Удалить", width=170, fg_color=RED, hover_color="#a33")
+        delete_btn.pack(side="right", padx=8)
+        state = {"before": None}   # граница удаления из update(); None — удалить нечего
+
+        def cutoff() -> datetime | None:
+            """Граница: записи раньше неё удаляются. datetime.max — все; None — срок введён с ошибкой."""
+            days = CLEAR_PERIODS[period.get()]
+            if days is None:   # своё значение
+                try:
+                    n = float(amount.get().strip().replace(",", "."))
+                except ValueError:
+                    return None
+                if not n >= 0:   # отрицательное и nan
+                    return None
+                days = n * CLEAR_UNITS[unit.get()]
+            elif days == 0:
+                return datetime.max
+            return datetime.now() - timedelta(days=days)
+
+        def update():
+            if period.get() == "Своё":
+                own.pack(anchor="w", padx=20, pady=(10, 0), after=period)
+            else:
+                own.pack_forget()
+            before = cutoff()
+            if before is None:
+                state["before"] = None
+                info.configure(text="Введите срок числом, например 3 или 1,5", text_color=RED)
+                delete_btn.configure(state="disabled", text="Удалить")
+                return
+            n = sum(1 for r in self.report if datetime.fromisoformat(r["time"]) < before)
+            state["before"] = before if n else None
+            if before is datetime.max:
+                text = f"Будут удалены все записи: {n}"
+            else:
+                text = (f"Будут удалены записи до {before:%d.%m.%Y %H:%M}: {n}" if n else
+                        f"Записей до {before:%d.%m.%Y %H:%M} нет — удалять нечего")
+            info.configure(text=text, text_color=("gray10", "gray90"))
+            delete_btn.configure(state="normal" if n else "disabled",
+                                 text=f"Удалить {n} шт." if n else "Удалить")
+
+        def do():
+            before = state["before"]
+            if before is None:
+                return
+            dlg.destroy()
+            try:
+                n = core.clear_report(None if before is datetime.max else before)
+            except OSError as e:
+                messagebox.showerror("Отчёт", f"Не удалось очистить: {e}")
+                return
+            self.load_report()
+            self.statusbar.configure(text=f"Из отчёта удалено записей: {n}", text_color="gray")
+
+        delete_btn.configure(command=do)
+        info.pack(fill="x", padx=20, pady=(12, 0), after=period)
+        update()
+        dlg.update_idletasks()
+        dlg.geometry(f"+{self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2}"
+                     f"+{self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3}")
+        dlg.after(100, dlg.grab_set)   # CTkToplevel показывается не сразу — модальность чуть позже
+
+    def export_report(self):
+        rows = self.report_rows
+        if not rows:
+            messagebox.showinfo("Отчёт", "Нечего выгружать — за выбранный период комментариев нет")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Сохранить отчёт", defaultextension=".csv", filetypes=[("Таблица CSV", "*.csv")],
+            initialfile=f"Комментарии {datetime.now():%Y-%m-%d}.csv")
+        if not path:
+            return
+        cols = {"Дата и время": lambda r: datetime.fromisoformat(r["time"]).strftime("%d.%m.%Y %H:%M:%S"),
+                "Профиль": lambda r: r.get("profile_name", ""), "Аккаунт": lambda r: r.get("account", ""),
+                "Канал": lambda r: r.get("channel", ""), "Пост": lambda r: r.get("post_id", ""),
+                "Ссылка": lambda r: r.get("link", ""), "Откуда текст": lambda r: r.get("source", ""),
+                "Комментарий": lambda r: r.get("comment", ""), "Картинка": lambda r: r.get("image", ""),
+                "Статус": lambda r: r.get("deleted") or "опубликован",
+                "Заготовка": lambda r: r.get("placeholder", ""), "Текст поста": lambda r: r.get("post_text", "")}
+        def cell(v) -> str:
+            # Excel считает формулой всё, что начинается с = + - @ (а «@канал» — у каждого публичного
+            # канала): будет #ИМЯ? или, хуже, исполнится формула из чужого поста. Невидимый
+            # пробел нулевой ширины в начале делает значение просто текстом
+            s = str(v)
+            return "\u200b" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+        try:
+            # utf-8-sig и «;» — так CSV сразу правильно открывается в русском Excel
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f, delimiter=";")
+                w.writerow(cols)
+                for r in reversed(rows):   # в файле — по порядку времени
+                    w.writerow([cell(get(r)) for get in cols.values()])
+        except OSError as e:
+            messagebox.showerror("Отчёт", f"Не удалось сохранить: {e}")
+            return
+        if messagebox.askyesno("Отчёт", f"Сохранено строк: {len(rows)}.\nОткрыть файл?"):
+            open_path(Path(path))
 
     # ------------------------------------------------------------------ журнал
 
@@ -2195,6 +2694,10 @@ class App(ctk.CTk):
         elif kind == "posted":
             self.posted_count += 1
             self.counter_lbl.configure(text=f"Опубликовано за сессию: {self.posted_count}")
+        elif kind == "report":
+            self.report_stale = True
+            if self.tabs.get() == "Отчёт":
+                self.load_report()
 
     def on_close(self):
         """Крестик: в трей (программа продолжает работать) или выход — по настройке."""

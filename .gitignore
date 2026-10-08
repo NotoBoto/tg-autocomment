@@ -11,6 +11,7 @@ _builtin_api.py
 log.txt
 *.log
 done_posts*.txt
+comments.jsonl
 _system_prompt*.txt
 _post_media/
 _agy_workspace*/
