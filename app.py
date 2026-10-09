@@ -87,6 +87,8 @@ def setup_logging() -> queue.Queue:
     tl = logging.getLogger("telethon")
     tl.setLevel(logging.WARNING)
     tl.addHandler(file_h)
+    # Кроме пауз по FloodWait: Telethon выжидает их молча (уровень INFO), а это задержка публикации
+    logging.getLogger("telethon.client.users").setLevel(logging.INFO)
     return q
 
 

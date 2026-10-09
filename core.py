@@ -25,7 +25,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.5.5"
+VERSION = "0.5.6"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -1066,6 +1066,7 @@ class Engine:
         self._paste_bag: list[str] = []
         self._last_paste = ""
         self._seen_groups: dict[int, None] = {}   # альбомы, уже взятые в работу (по порядку — для чистки)
+        self._linked: dict[int, object] = {}   # канал → его группа обсуждения (None — её нет)
         self._gen_lock: asyncio.Lock | None = None
         self._api_client = None
         self._api_client_key = None
@@ -1526,6 +1527,69 @@ class Engine:
                 return
         await self._comment_on(p, parts, confirm, instant, see_images and has_media)
 
+    async def _find_thread(self, p: Pending, parts) -> bool:
+        """Моментальный режим: найти копию поста в группе обсуждения как можно раньше.
+        False — у поста точно нет обсуждения.
+
+        Telegram создаёт копию через несколько секунд после поста, а до этого на запрос обсуждения
+        отвечает «подождите 2 сек» — Telethon выжидает молча, кусками по 2 секунды. Поэтому
+        параллельно опрашиваем последние сообщения группы (раз в 0,15 с, только пока
+        ждём копию этого поста): копия видна там сразу, как появится.
+        Что ответит первым, то и берём. Не нашли — отправка спросит обсуждение сама.
+        Опрашиваем, только если у поста есть пометка о комментариях: бывают посты без обсуждения,
+        и копия под ними не появится. У альбома пометка только на одной из частей."""
+        from telethon.tl import functions
+
+        async def ask():
+            d = await self.client(functions.messages.GetDiscussionMessageRequest(p.chat_id, p.post_id))
+            top = min(d.messages, key=lambda m: m.id)
+            group = next(c for c in d.chats if utils.get_peer_id(c) == utils.get_peer_id(top.peer_id))
+            return utils.get_input_peer(group), top.id
+
+        async def poll():
+            if p.chat_id not in self._linked:
+                full = await self.client(functions.channels.GetFullChannelRequest(p.chat_id))
+                gid = full.full_chat.linked_chat_id
+                group = next((c for c in full.chats if c.id == gid), None) if gid else None
+                self._linked[p.chat_id] = utils.get_input_peer(group) if group else None
+            group = self._linked[p.chat_id]
+            if not group:   # группы нет — ответ за запросом обсуждения
+                raise LookupError("у канала нет группы обсуждения")
+            channel_id = utils.resolve_id(p.chat_id)[0]
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                # Обычно ответ за 0,15 с. Дольше — Telegram попросил подождать и Telethon выжидает:
+                # опрос бросаем, чтобы не нагружать аккаунт, остаётся запрос обсуждения
+                h = await asyncio.wait_for(self.client(
+                    functions.messages.GetHistoryRequest(group, 0, None, 0, 10, 0, 0, 0)), 1.5)
+                for m in h.messages:
+                    f = getattr(m, "fwd_from", None)
+                    if (f and f.saved_from_msg_id == p.post_id
+                            and getattr(f.saved_from_peer, "channel_id", None) == channel_id):
+                        return group, m.id
+                await asyncio.sleep(0.15)
+            raise LookupError("копия поста в группе не появилась")   # остаётся запрос обсуждения
+
+        has_comments = any(m.replies and m.replies.comments for m in parts)
+        tasks = [asyncio.ensure_future(ask())] + ([asyncio.ensure_future(poll())] if has_comments else [])
+        try:
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(pending, timeout=40, return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    return True
+                for t in done:
+                    if not t.exception():
+                        p.reply_peer, p.reply_to = t.result()
+                        return True
+                    if isinstance(t.exception(), errors.MsgIdInvalidError):   # обсуждения у поста нет
+                        return False
+                    self.log.debug("Пост #%s: обсуждение не найдено: %s", p.post_id, t.exception())
+            return True
+        finally:
+            for t in tasks:
+                t.cancel()
+
     async def _check_rights(self, p: Pending) -> str:
         """Можно ли комментировать пост; "" — можно. Заодно запоминает в p группу обсуждения
         и что в ней разрешено (картинки, текст без картинки).
@@ -1540,7 +1604,7 @@ class Engine:
             top = min(d.messages, key=lambda m: m.id)
             group = next(c for c in d.chats if utils.get_peer_id(c) == utils.get_peer_id(top.peer_id))
         except errors.MsgIdInvalidError:
-            return "у канала выключены комментарии"
+            return "у поста нет обсуждения"
         except errors.ChannelPrivateError:
             return SEND_ERRORS[errors.ChannelPrivateError].lower()
         except Exception as e:   # сеть, неожиданный ответ — решит сама отправка
@@ -1584,6 +1648,9 @@ class Engine:
     async def _comment_on(self, p: Pending, parts, confirm: bool, instant: bool, with_images: bool):
         cfg, post_id = self.cfg, p.post_id
         if instant:
+            if not await self._find_thread(p, parts):
+                self.log.info("Пост #%s %s: у поста нет обсуждения — пропуск", post_id, p.channel)
+                return
             p.comment = p.generated = random.choice(cfg["instant_comments"])
             p.source = "заготовка"
             # Заготовка — только текст: ей не ждать загрузки картинки. Картинка придёт вместе
@@ -2132,6 +2199,7 @@ class Engine:
             self.log.info("Пост #%s: комментарий длиннее %d символов и в подпись к картинке не помещается — "
                           "публикую без картинки", p.post_id, CAPTION_LIMIT)
             p.image = None
+        started = time.perf_counter()
         try:
             try:
                 sent = await self._with_flood_wait(lambda: self._send_once(p))
@@ -2155,8 +2223,8 @@ class Engine:
             p.error = send_error_text(e)
         else:
             p.sent_chat, p.sent_id = sent.chat_id, sent.id
-            self.log.info("✅ Комментарий опубликован под #%s (картинка: %s)",
-                          p.post_id, p.image.name if p.image else "нет")
+            self.log.info("✅ Комментарий опубликован под #%s за %.1f сек (картинка: %s)",
+                          p.post_id, time.perf_counter() - started, p.image.name if p.image else "нет")
             self.done_posts.add(p.post_key)
             self._report_sent(p)
             with self.done_file.open("a") as f:
