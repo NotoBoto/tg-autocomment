@@ -584,6 +584,7 @@ class App(ctk.CTk):
         self.login_waiting: list[str] = []   # профили, ждущие окна входа (оно одно на всех)
         self.selected: str | None = None     # Pending.uid
         self.shown_comment: dict[str, str] = {}
+        self.comment_uid: str | None = None   # чей комментарий сейчас в поле (Pending.uid)
         self.posted_count = 0
         self.status = "stopped"   # общий статус; нужен сразу — меню трея читает его из своего потока
 
@@ -1309,7 +1310,8 @@ class App(ctk.CTk):
 
     def save_draft(self):
         p = self.current()
-        if p and not p.busy:
+        # В поле может быть ещё не его текст — тогда чужой черновик ему не записываем
+        if p and not p.busy and self.comment_uid == p.uid:
             p.comment = self.comment_box.get("1.0", "end-1c")
             self.shown_comment[p.uid] = p.comment   # это уже показано — не вставлять заново
 
@@ -1420,12 +1422,14 @@ class App(ctk.CTk):
         self.post_box.insert("1.0", p.post_text or "(текста нет, только медиа)")
         self.post_box.configure(state="disabled")
 
-        # Не затираем ручные правки, если текст от модели не менялся
-        if self.shown_comment.get(p.uid) != p.comment or self.comment_box.get("1.0", "end-1c") == "":
+        # Не затираем ручные правки, если в поле этот же комментарий и текст от модели не менялся
+        if (self.comment_uid != p.uid or self.shown_comment.get(p.uid) != p.comment
+                or self.comment_box.get("1.0", "end-1c") == ""):
             self.comment_box.configure(state="normal")
             self.comment_box.delete("1.0", "end")
             self.comment_box.insert("1.0", p.comment)
             self.shown_comment[p.uid] = p.comment
+            self.comment_uid = p.uid
         self.show_image(p)
 
         if p.busy:
@@ -1502,7 +1506,8 @@ class App(ctk.CTk):
 
     def publish(self):
         if p := self.current():
-            text = self.comment_box.get("1.0", "end-1c").strip()
+            # Публикуем только текст этого поста: если в поле почему-то чужой — берём его собственный
+            text = (self.comment_box.get("1.0", "end-1c") if self.comment_uid == p.uid else p.comment).strip()
             if not text:
                 messagebox.showwarning("Пусто", "Комментарий пустой")
                 return
