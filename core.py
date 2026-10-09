@@ -25,7 +25,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.5.4"
+VERSION = "0.5.5"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -867,8 +867,10 @@ class Pending:
     post_images: list[Path] = field(default_factory=list)
     comment: str = ""
     image: Path | None = None
+    later_image: Path | None = None   # моментальный режим: картинка, которая придёт вместе с настоящим текстом
     media_ok: bool = True    # можно ли прикладывать картинку в группе обсуждения
     plain_ok: bool = True    # можно ли писать без картинки
+    plain_forbidden: bool = False   # отправка без картинки получила отказ: в обсуждении так нельзя
     reply_peer: object = None   # группа обсуждения и id поста в ней — из проверки прав,
     reply_to: int = 0           # чтобы отправка не спрашивала их у Telegram ещё раз
     sent_chat: int = 0       # где и под каким id опубликован (группа обсуждения) —
@@ -948,6 +950,8 @@ def _apply_report(recs: dict[str, dict], r: dict | None):
             cur["placeholder"] = cur["comment"]
             cur["comment"] = r["comment"]
             cur["source"] = r.get("source") or cur.get("source", "")
+            if r.get("image"):   # картинка заготовки пришла вместе с настоящим текстом
+                cur["image"] = r["image"]
         else:
             cur["deleted"] = r.get("reason") or "удалён"
 
@@ -1496,7 +1500,9 @@ class Engine:
     async def _take_post(self, msg, key, post_id, post_text, parts, manual, confirm, instant):
         cfg = self.cfg
         chan = self.channel_names.get(msg.chat_id, "")
-        self.log.info("Новый пост %s #%s: %s", chan, post_id, post_text[:80].replace("\n", " "))
+        # Сколько прошло с выхода поста — видно, не опаздывает ли сам Telegram с уведомлением
+        lag = "" if manual else f" (вышел {(datetime.now(timezone.utc) - msg.date).total_seconds():.0f} сек назад)"
+        self.log.info("Новый пост %s #%s%s: %s", chan, post_id, lag, post_text[:80].replace("\n", " "))
 
         see_images = cfg.get("send_post_images", False) and not self.no_ai
         has_media = any(m.photo or m.video or m.gif for m in parts)
@@ -1580,11 +1586,18 @@ class Engine:
         if instant:
             p.comment = p.generated = random.choice(cfg["instant_comments"])
             p.source = "заготовка"
-            p.image = self.pick_image()
+            # Заготовка — только текст: ей не ждать загрузки картинки. Картинка придёт вместе
+            # с настоящим комментарием
+            p.later_image = self.pick_image()
             self.log.info("Пост #%s: сразу публикую заготовку «%s», настоящий комментарий заменит её",
                           post_id, p.comment)
             if not await self._send(p):
-                return
+                if not p.plain_forbidden:
+                    return
+                # Без картинки в обсуждении писать нельзя — заготовка уходит с картинкой сразу
+                p.image, p.later_image, p.error = self.pick_image(force=True), None, ""
+                if not p.image or not await self._send(p):
+                    return
         if with_images:
             # Своя папка у каждого варианта: картинки двух вариантов одного поста не мешают друг другу
             folder = self.media_dir / p.key.replace(":", "_").replace("#", "_")
@@ -1679,13 +1692,21 @@ class Engine:
             self._emit("pending_update", p)
 
     async def _replace_placeholder(self, p: Pending):
-        """Заготовка уже под постом — заменить её текст сгенерированным комментарием."""
+        """Заготовка уже под постом — заменить её текст сгенерированным комментарием
+        и добавить картинку, отложенную при публикации заготовки."""
+        # Картинка загружается в Telegram, пока нейросеть пишет текст
+        upload = (asyncio.ensure_future(self.client.upload_file(str(p.later_image)))
+                  if p.later_image else None)
         try:
             text = await self._generate(p.post_text, p.post_images)
         except Exception as e:
+            if upload:
+                upload.cancel()
             self.log.error("%s — под постом #%s остаётся заготовка", self._ai_error(e), p.post_id)
             return
         if not text:
+            if upload:
+                upload.cancel()
             # Тяжёлая тема: дежурное «Интересно» под таким постом хуже, чем ничего
             try:
                 await self.client.delete_messages(p.sent_chat, [p.sent_id])
@@ -1696,11 +1717,38 @@ class Engine:
                 self.log.error("Пост #%s: модель ответила SKIP, но заготовку удалить не удалось: %s",
                                p.post_id, e)
             return
+        file = None
+        if upload:
+            try:
+                file = await upload
+            except Exception as e:
+                self.log.warning("Пост #%s: картинку %s загрузить не удалось (%s) — заменю только текст",
+                                 p.post_id, p.later_image.name, e)
+        if file and len(text) > CAPTION_LIMIT:
+            self.log.info("Пост #%s: комментарий длиннее %d символов и в подпись к картинке не помещается — "
+                          "заменю без картинки", p.post_id, CAPTION_LIMIT)
+            file = None
         try:
-            await self._with_flood_wait(lambda: self.client.edit_message(p.sent_chat, p.sent_id, text))
-            self.log.info("✏️ Заготовка под #%s заменена сгенерированным комментарием", p.post_id)
-            self._report({"type": "edited", "id": f"{p.sent_chat}:{p.sent_id}", "comment": text,
-                          "source": self.source_name()})
+            try:
+                await self._with_flood_wait(
+                    lambda: self.client.edit_message(p.sent_chat, p.sent_id, text, file=file))
+            except (errors.FloodWaitError, errors.MessageIdInvalidError, errors.MessageNotModifiedError):
+                raise
+            except errors.RPCError as e:
+                if not file:
+                    raise
+                # Картинку к заготовке добавить не дали — пусть будет хотя бы настоящий текст
+                self.log.warning("Пост #%s: картинку к комментарию добавить не удалось (%s) — "
+                                 "заменяю только текст", p.post_id, e)
+                file = None
+                await self._with_flood_wait(lambda: self.client.edit_message(p.sent_chat, p.sent_id, text))
+            self.log.info("✏️ Заготовка под #%s заменена сгенерированным комментарием (картинка: %s)",
+                          p.post_id, p.later_image.name if file else "нет")
+            rec = {"type": "edited", "id": f"{p.sent_chat}:{p.sent_id}", "comment": text,
+                   "source": self.source_name()}
+            if file:
+                rec["image"] = p.later_image.name
+            self._report(rec)
             return
         except errors.MessageNotModifiedError:
             return
@@ -2094,6 +2142,9 @@ class Engine:
                                  p.post_id)
                 p.image = None
                 sent = await self._with_flood_wait(lambda: self._send_once(p))
+        except errors.ChatSendPlainForbiddenError as e:
+            p.plain_forbidden = True
+            p.error = send_error_text(e)
         except errors.SlowModeWaitError as e:
             p.error = f"В группе обсуждения медленный режим: писать можно через {e.seconds} сек"
         except errors.FloodWaitError as e:

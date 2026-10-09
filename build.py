@@ -86,6 +86,7 @@ def main():
         "--add-data", f"{ROOT / 'assets' / 'icon.ico'}{sep}assets",
         "--collect-data", "customtkinter",      # темы и шрифты customtkinter
         "--hidden-import", "pystray._win32",    # pystray выбирает бэкенд при запуске
+        "--hidden-import", "cryptg",            # Telethon ищет его при запуске; без него шифрует медленно
         str(ROOT / "app.py"),
     ], check=True)
     print(f"Программа: {DIST / NAME / (NAME + '.exe')}")
