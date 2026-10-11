@@ -25,7 +25,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.5.6"
+VERSION = "0.5.7"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -61,7 +61,7 @@ DEFAULTS = {
     "proxy_mode": "system",        # прокси для Telegram: system (из VPN/Windows) | custom | none
     "proxy": "",                   # для custom: socks5://…, http://… или ссылка MTProxy
     "channels": [],                # каналы, за которыми следим
-    "backend": "claude_code",      # claude_code | api (Anthropic) | gemini_cli (Antigravity) | gemini_api | codex | openai_api | openai_compat
+    "backend": "claude_code",      # claude_code | api (Anthropic) | gemini_cli (Antigravity) | gemini_api | codex | openai_api | zai | openai_compat
                                    # | pastes — без нейросети, случайная паста из списка
     "model": "sonnet",
     "api_key": "",
@@ -75,6 +75,8 @@ DEFAULTS = {
     "compat_base_url": "http://localhost:1234/v1",   # своя модель: OpenAI-совместимый сервер (LM Studio…)
     "compat_api_key": "",          # большинству локальных серверов не нужен
     "compat_model": "",
+    "zai_api_key": "",             # Z.ai: бесплатный ключ с z.ai, работает из России без VPN
+    "zai_model": "glm-4.7-flash",
     "prompt_file": "prompt.txt",
     "images_dir": "images",
     "attach_image_chance": 1.0,
@@ -399,6 +401,10 @@ def validate(cfg) -> list[str]:
         if not openai_key(cfg):
             problems.append("Не указан API-ключ OpenAI — «Настройки» → «Нейросеть»")
         return problems
+    if backend == "zai":
+        if not zai_key(cfg):
+            problems.append("Не указан ключ Z.ai — «Настройки» → «Нейросеть» → «Получить бесплатный ключ»")
+        return problems
     if backend == "openai_compat":
         if not str(cfg.get("compat_base_url", "")).strip():
             problems.append("Не указан адрес сервера своей модели — «Настройки» → «Нейросеть»")
@@ -538,7 +544,7 @@ def set_autostart(on: bool):
 
 BACKEND_NAMES = {"claude_code": "Claude Code", "api": "Claude API", "gemini_cli": "Antigravity",
                  "gemini_api": "Gemini API", "codex": "Codex", "openai_api": "OpenAI API",
-                 "openai_compat": "Своя модель", "pastes": "Пасты"}
+                 "zai": "Z.ai", "openai_compat": "Своя модель", "pastes": "Пасты"}
 
 # Так сервисы отвечают на запрос из страны, где они не работают
 REGION_MARKERS = ("not currently available in your location", "location is not supported",
@@ -556,7 +562,7 @@ def explain_ai_error(name: str, msg: str) -> str:
         text += (f"\n{name} недоступен из страны, откуда пришёл запрос. Включите VPN с сервером там, где сервис "
                  f"работает (например, США или Европа) — в режиме TUN или «системный прокси» — и повторите. "
                  f"Сейчас запросы идут {route}. Не помогает — попробуйте другой сервер VPN или другой "
-                 "способ подключения в «Настройках».")
+                 "способ подключения в «Настройках». Без VPN работает «Z.ai (бесплатно)».")
     return text
 
 
@@ -805,6 +811,19 @@ def compat_client(cfg, asynchronous=False):
     return openai.OpenAI(base_url=url, api_key=key, http_client=http, timeout=20, max_retries=0)
 
 
+def chat_content(user_msg: str, images: list[Path]) -> str | list:
+    """Сообщение для chat/completions: текст, а с картинками — текст и картинки в data:-URL."""
+    if not images:
+        return user_msg
+    content = [{"type": "text", "text": user_msg + "\n\nК посту приложены картинки — учти, что на них. "
+                                                   "Выведи только сам комментарий."}]
+    for img in images:
+        mime = mimetypes.guess_type(img.name)[0] or "image/jpeg"
+        content.append({"type": "image_url", "image_url": {
+            "url": f"data:{mime};base64,{base64.b64encode(img.read_bytes()).decode()}"}})
+    return content
+
+
 def compat_connection_hint(url: str) -> str:
     if is_local_url(url):
         return (f"Нет связи с {url} — запущен ли сервер? LM Studio: вкладка Developer → Start Server; "
@@ -837,6 +856,135 @@ def check_compat(cfg) -> tuple[bool, str, list[str]]:
     if model and model not in models:
         return True, f"Сервер работает ✓, но модели {model} нет — выберите из списка", models
     return True, f"Сервер работает ✓  моделей: {len(models)}", models
+
+
+# ---------- Z.ai (GLM): бесплатные модели, работает из России без VPN и без карты ----------
+# API OpenAI-совместимый. Бесплатные модели отвечают по одному запросу за раз на ключ.
+
+ZAI_URL = "https://api.z.ai/api/paas/v4"
+ZAI_KEYS_URL = "https://z.ai/manage-apikey/apikey-list"
+ZAI_MODELS = ["glm-4.7-flash", "glm-4.5-flash"]   # бесплатные текстовые — по порядку предпочтения
+ZAI_VISION_MODEL = "glm-4.6v-flash"              # бесплатная, видит картинки поста
+ZAI_KEY_RE = re.compile(r"^[0-9A-Za-z]{24,64}\.[0-9A-Za-z]{8,32}$")   # так выглядит ключ: «a1b2…f9.XyZ…»
+ZAI_RETRY_DELAYS = (5, 15, 30)   # паузы перед повтором, когда Z.ai занят или сбоит
+ZAI_CHECK_WAIT = 120             # сколько проверка ключа ждёт, пока аккаунты допишут свои запросы, сек
+_zai_locks: dict[str, threading.Lock] = {}   # по ключу: профили работают каждый в своём потоке
+_zai_locks_guard = threading.Lock()
+_zai_gone: set[str] = set()          # модели, которые Z.ai перестал узнавать (код 1211) — дальше их пропускаем
+_zai_no_thinking: set[str] = set()   # модели, которые не приняли параметр thinking — шлём без него
+
+
+def zai_key(cfg) -> str | None:
+    return str(cfg.get("zai_api_key", "")).strip() or os.environ.get("ZAI_API_KEY")
+
+
+def zai_lock(key: str) -> threading.Lock:
+    with _zai_locks_guard:
+        return _zai_locks.setdefault(key, threading.Lock())
+
+
+def zai_client(key: str, asynchronous=False):
+    import openai
+    if asynchronous:
+        return openai.AsyncOpenAI(base_url=ZAI_URL, api_key=key, max_retries=0)   # повторы — свои, с паузами
+    return openai.OpenAI(base_url=ZAI_URL, api_key=key, timeout=30, max_retries=0)
+
+
+def zai_extra(model: str) -> dict | None:
+    """Для комментария думать незачем — без «размышлений» быстрее. Не принявшим параметр — не шлём."""
+    return None if model in _zai_no_thinking else {"thinking": {"type": "disabled"}}
+
+
+def zai_thinking_rejected(model: str, status: int, msg: str) -> bool:
+    """Модель не приняла thinking — запоминаем, чтобы повторить без него. True — стоит повторить."""
+    if status == 400 and "thinking" in msg.lower() and model not in _zai_no_thinking:
+        _zai_no_thinking.add(model)
+        return True
+    return False
+
+
+def zai_error(e) -> tuple[str, str]:
+    """Код и текст ошибки Z.ai: {"error": {"code": "1302", "message": "…"}}."""
+    body = getattr(e, "body", None)
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        body = body["error"]
+    if not isinstance(body, dict):
+        body = {}
+    return str(body.get("code", "")), str(body.get("message") or getattr(e, "message", "") or e)
+
+
+ZAI_BAD_KEY = "Ключ Z.ai не подходит — скопируйте его заново на z.ai («Получить бесплатный ключ»)"
+ZAI_BUSY_CODES = {"1302", "1305", "1313"}            # «слишком часто» и «перегружен» — подождать и повторить
+ZAI_LIMIT_CODES = {"1308", "1310", "1316", "1317"}   # исчерпан лимит за период — повтор не поможет
+
+
+def zai_busy(status: int, code: str) -> bool:
+    """Временная занятость или сбой Z.ai — стоит подождать и повторить."""
+    return code in ZAI_BUSY_CODES or status >= 500 or (status == 429 and not code)
+
+
+def zai_error_text(status: int, code: str, msg: str, model: str) -> str:
+    if code in ZAI_LIMIT_CODES:
+        return f"Исчерпан бесплатный лимит Z.ai — {msg}"
+    choose = (f"выберите бесплатную {ZAI_MODELS[0]} в «Настройках»" if model not in ZAI_MODELS
+              else "похоже, бесплатной она больше не является — выберите другую модель в «Настройках»")
+    if code == "1113":
+        return f"Z.ai просит пополнить баланс для модели {model} — {choose}"
+    if code == "1311":
+        return f"Модель {model} не входит в ваш тариф Z.ai — {choose}"
+    if code == "1211":
+        return f"Z.ai не знает модель {model} — выберите другую в «Настройках»"
+    if code == "1301":
+        return "Z.ai отказался отвечать: посчитал пост или промпт недопустимым"
+    return f"Ошибка Z.ai ({status}): {msg}"
+
+
+def zai_models_order(model: str) -> list[str]:
+    """Выбранная модель, за ней остальные бесплатные — на случай, если Z.ai какую-то отключил."""
+    return [m for m in dict.fromkeys([model, *ZAI_MODELS]) if m not in _zai_gone] or [model]
+
+
+def check_zai_key(cfg) -> tuple[bool, str, list[str]]:
+    """Проверка ключа крошечным запросом к модели — для бесплатной ничего не стоит.
+    Возвращает список моделей, первой — рабочую (её и выберет окно)."""
+    import openai
+    key = zai_key(cfg)
+    if not key:
+        return False, "Ключ не указан", []
+    model = str(cfg.get("zai_model", "")).strip() or ZAI_MODELS[0]
+    models = zai_models_order(model)
+    lock = zai_lock(key)   # бесплатно — по одному запросу на ключ: не мешаем работающим аккаунтам
+    if not lock.acquire(timeout=ZAI_CHECK_WAIT):
+        return False, "Z.ai занят запросами аккаунтов — проверьте ключ чуть позже", []
+    try:
+        with zai_client(key) as client:
+            while True:
+                try:
+                    client.chat.completions.create(
+                        model=models[0], max_tokens=1, messages=[{"role": "user", "content": "Привет"}],
+                        extra_body=zai_extra(models[0]))
+                    break
+                except openai.BadRequestError as e:
+                    code, msg = zai_error(e)
+                    if code == "1211" and len(models) > 1:
+                        _zai_gone.add(models.pop(0))
+                    elif not zai_thinking_rejected(models[0], e.status_code, msg):
+                        raise
+    except openai.AuthenticationError:
+        return False, ZAI_BAD_KEY, []
+    except openai.APIConnectionError:
+        return False, "Нет связи с Z.ai — проверьте интернет", []
+    except openai.APIStatusError as e:
+        code, msg = zai_error(e)
+        if code in ZAI_BUSY_CODES:   # до лимита дошли — значит, ключ рабочий
+            return True, "Ключ работает ✓ (Z.ai сейчас занят) — нажмите «Сохранить»", models
+        return False, zai_error_text(e.status_code, code, msg, models[0]), []
+    finally:
+        lock.release()
+    if models[0] != model:
+        return True, f"Ключ работает ✓, но модели {model} больше нет — выбрана {models[0]}. " \
+                     "Нажмите «Сохранить»", models
+    return True, "Ключ работает ✓ — нажмите «Сохранить»", models
 
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)   # «размышления» DeepSeek-R1, Qwen3 и т. п.
@@ -1846,7 +1994,7 @@ class Engine:
                 user_msg += f"\n\nПОЖЕЛАНИЯ: {wish.strip()}"
             gen = {"api": self._gen_api, "gemini_cli": self._gen_gemini_cli,
                    "gemini_api": self._gen_gemini_api, "codex": self._gen_codex,
-                   "openai_api": self._gen_openai_api,
+                   "openai_api": self._gen_openai_api, "zai": self._gen_zai,
                    "openai_compat": self._gen_compat}.get(self.cfg.get("backend"), self._gen_claude_code)
             text = await gen(system, user_msg, images)
             if not text or text.upper().startswith("SKIP"):
@@ -2041,14 +2189,7 @@ class Engine:
         sig = (url, cfg.get("compat_api_key", ""))
         if getattr(self, "_compat_sig", None) != sig:
             self._compat_client, self._compat_sig = compat_client(cfg, asynchronous=True), sig
-        content: str | list = user_msg
-        if images:   # картинки понимают только модели с vision; без них сервер вернёт ошибку
-            content = [{"type": "text", "text": user_msg + "\n\nК посту приложены картинки — учти, что на них. "
-                                                           "Выведи только сам комментарий."}]
-            for img in images:
-                mime = mimetypes.guess_type(img.name)[0] or "image/jpeg"
-                content.append({"type": "image_url", "image_url": {
-                    "url": f"data:{mime};base64,{base64.b64encode(img.read_bytes()).decode()}"}})
+        content = chat_content(user_msg, images)   # картинки понимают только модели с vision
         model = str(cfg.get("compat_model", "")).strip()
         try:
             resp = await self._compat_client.with_options(
@@ -2073,6 +2214,70 @@ class Engine:
         u = resp.usage
         if u:
             self.log.info("Своя модель %s: вход %s ток., выход %s ток.", model, u.prompt_tokens, u.completion_tokens)
+        text = (resp.choices[0].message.content or "") if resp.choices else ""
+        return strip_reasoning(text)
+
+    async def _gen_zai(self, system: str, user_msg: str, images: list[Path]) -> str:
+        """Z.ai: бесплатные GLM. Запросы всех профилей с одним ключом — по очереди, занятость — пауза и повтор."""
+        import openai
+        cfg = self.cfg
+        key = zai_key(cfg)
+        if not key:
+            raise RuntimeError("Не указан ключ Z.ai — «Настройки» → «Нейросеть»")
+        if getattr(self, "_zai_client_key", None) != key:
+            self._zai_client, self._zai_client_key = zai_client(key, asynchronous=True), key
+        # Попытки по порядку: пост с картинками — сперва модели, которая их видит; если её отключили —
+        # текстовой по одному тексту. Дальше — выбранная текстовая и запасные бесплатные.
+        attempts = [(m, user_msg) for m in zai_models_order(str(cfg.get("zai_model", "")).strip() or ZAI_MODELS[0])]
+        if images and ZAI_VISION_MODEL not in _zai_gone:
+            attempts.insert(0, (ZAI_VISION_MODEL, chat_content(user_msg, images)))
+        lock = zai_lock(key)
+        if not lock.acquire(blocking=False):
+            self.log.info("Z.ai: жду, пока закончится запрос другого аккаунта (бесплатно — по одному за раз)")
+            while not lock.acquire(blocking=False):   # не to_thread: при отмене задачи замок не повиснет
+                await asyncio.sleep(0.3)
+        try:
+            (model, content), resp, delays = attempts.pop(0), None, list(ZAI_RETRY_DELAYS)
+            while resp is None:
+                try:
+                    resp = await self._zai_client.with_options(
+                        timeout=float(cfg.get("claude_timeout_sec", 120))).chat.completions.create(
+                        model=model, messages=[{"role": "system", "content": system},
+                                               {"role": "user", "content": content}],
+                        extra_body=zai_extra(model))
+                    continue
+                except openai.AuthenticationError:
+                    raise RuntimeError(ZAI_BAD_KEY)
+                except openai.APITimeoutError:   # до APIConnectionError: это её подкласс
+                    raise RuntimeError("Z.ai не ответил вовремя — увеличьте «Таймаут ответа» в «Настройках»")
+                except openai.APIConnectionError:
+                    why = "нет связи"
+                except openai.APIStatusError as e:
+                    code, msg = zai_error(e)
+                    if code == "1211" and attempts:   # модель отключили — берём следующую
+                        _zai_gone.add(model)
+                        nxt, content = attempts.pop(0)
+                        self.log.warning("Z.ai больше не знает модель %s — %s", model,
+                                         f"пишу по тексту поста, без картинок ({nxt})" if model == ZAI_VISION_MODEL
+                                         else f"перехожу на {nxt}. Выберите её в «Настройках», "
+                                              "чтобы не видеть это сообщение")
+                        model = nxt
+                        continue
+                    if zai_thinking_rejected(model, e.status_code, msg):
+                        continue
+                    if not zai_busy(e.status_code, code):
+                        raise RuntimeError(zai_error_text(e.status_code, code, msg, model))
+                    why = msg
+                if not delays:
+                    raise RuntimeError(f"Z.ai перегружен или недоступен ({why}) — попробуйте позже")
+                d = delays.pop(0)
+                self.log.info("Z.ai занят (%s) — повторю через %s с", why, d)
+                await asyncio.sleep(d)
+        finally:
+            lock.release()
+        u = resp.usage
+        if u:
+            self.log.info("Z.ai %s: вход %s ток., выход %s ток.", model, u.prompt_tokens, u.completion_tokens)
         text = (resp.choices[0].message.content or "") if resp.choices else ""
         return strip_reasoning(text)
 

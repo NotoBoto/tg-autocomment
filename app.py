@@ -42,7 +42,7 @@ LABEL_W = 270  # ширина колонки подписей в блоке «Н
 BACKENDS = {"Claude Code": "claude_code", "Claude API": "api",
             "Antigravity (Google)": "gemini_cli", "Gemini API": "gemini_api",
             "ChatGPT (Codex)": "codex", "OpenAI API": "openai_api",
-            "Своя модель": "openai_compat", "Без нейросети": "pastes"}
+            "Z.ai (бесплатно)": "zai", "Своя модель": "openai_compat", "Без нейросети": "pastes"}
 DEFAULT_MODEL = "(по умолчанию)"
 PROXY_MODES = {"Системный (из VPN)": "system", "Свой": "custom", "Без прокси": "none"}
 MODE_CONFIRM, MODE_AUTO = "Подтверждать вручную", "Публиковать сами"
@@ -464,7 +464,8 @@ class CliBlock:
             "без VPN не пройдёт — Google, OpenAI и Anthropic проверяют страну.\n\n"
             "Если вы в такой стране — нажмите «Отмена», включите VPN с сервером в США или Европе "
             "(режим TUN или системный HTTP-прокси) и повторите вход.\n\n"
-            "Если VPN в режиме TUN уже включён или ваша страна поддерживается — нажмите «ОК»."))
+            "Если VPN в режиме TUN уже включён или ваша страна поддерживается — нажмите «ОК».\n\n"
+            "Нет VPN — выберите в «Нейросети» способ «Z.ai (бесплатно)»: он работает в России."))
 
     def start_login(self):
         relogin = bool(self.state.get("loggedIn"))
@@ -523,9 +524,10 @@ class KeyBlock:
     """Поле API-ключа + «показать» + «Проверить ключ» + ссылка, где взять ключ."""
 
     def __init__(self, app: "App", parent, key_field, placeholder, link_text, url,
-                 model_widget, model_field, check_fn):
+                 model_widget, model_field, check_fn, autoselect=False):
+        """autoselect — после проверки выбрать первую модель из списка, если выбранной там нет."""
         self.app, self.key_field, self.model_field = app, key_field, model_field
-        self.model_widget, self.check_fn = model_widget, check_fn
+        self.model_widget, self.check_fn, self.autoselect = model_widget, check_fn, autoselect
         ctk.CTkLabel(parent, text="API-ключ").grid(row=1, column=0, sticky="w", padx=14, pady=5)
         self.entry = e = ctk.CTkEntry(parent, show="•", placeholder_text=placeholder)
         e.grid(row=1, column=1, sticky="ew", padx=4)
@@ -555,6 +557,8 @@ class KeyBlock:
             self.lbl.configure(text=msg, text_color=GREEN if ok else RED)
             if models and models[0]:   # проверка вернула список доступных моделей
                 self.model_widget.configure(values=models[0])
+                if self.autoselect and self.model_widget.get().strip() not in models[0]:
+                    self.model_widget.set(models[0][0])
         self.app.in_thread(lambda: self.check_fn(cfg), done)
 
 
@@ -1544,7 +1548,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(self.welcome, justify="left", anchor="w", wraplength=900, text=(
             "👋  Добро пожаловать! Для начала работы:\n"
             "0. В блоке «Нейросеть» выберите способ: Claude Code, Antigravity или ChatGPT (вход в аккаунт, "
-            "кнопка «Установить и войти»), API-ключ Claude/Gemini/OpenAI, свою модель (LM Studio, Ollama) "
+            "кнопка «Установить и войти»), API-ключ Claude/Gemini/OpenAI, Z.ai (бесплатно, работает в России "
+            "без VPN), свою модель (LM Studio, Ollama) "
             "или «Без нейросети» — тогда программа постит случайные пасты из вашего списка\n"
             + ("1. API ID и API Hash указывать не нужно — в программу встроен свой ключ\n"
                if core.BUILTIN_TELEGRAM_APP else
@@ -1708,6 +1713,22 @@ class App(ctk.CTk):
                  core.check_openai_key)
         model_row(oa, 3, self.openai_api_model, "список моделей подгрузится после «Проверить ключ»")
 
+        # --- Z.ai: бесплатные GLM, работает из России ---
+        za = sub("Бесплатные нейросети GLM от Z.ai. Работают в России без VPN, карта не нужна — только "
+                 "бесплатный ключ. Посты с картинками сами уходят в модель, которая их видит. Бесплатно "
+                 "отвечают по одному запросу за раз — несколько аккаунтов встают в очередь сами.")
+        self.zai_model = ctk.CTkComboBox(za, values=core.ZAI_MODELS, width=260)
+        self.zai_block = KeyBlock(self, za, "zai_api_key", "вставится сам, когда скопируете",
+                                  "Получить бесплатный ключ → z.ai", core.ZAI_KEYS_URL, self.zai_model,
+                                  "zai_model", core.check_zai_key, autoselect=True)
+        ctk.CTkLabel(za, justify="left", anchor="w", text=(
+            "1. Нажмите «Получить бесплатный ключ» — откроется сайт Z.ai (на английском).\n"
+            "2. Войдите через Google или зарегистрируйтесь по почте (Sign up).\n"
+            "3. Нажмите «Create a new API key» (создать ключ), введите любое имя и скопируйте ключ (Copy).\n"
+            "4. Вернитесь в программу — ключ вставится и проверится сам. Нажмите «Сохранить».")
+        ).grid(row=3, column=1, columnspan=2, sticky="w", padx=4, pady=(4, 6))
+        model_row(za, 4, self.zai_model, "менять не нужно — glm-4.7-flash бесплатная и самая новая из бесплатных")
+
         # --- своя модель: любой OpenAI-совместимый сервер ---
         lm = sub("Своя нейросеть на OpenAI-совместимом сервере: локально — LM Studio, Ollama, llama.cpp, vLLM "
                  "(бесплатно, без интернета и VPN), или облачные OpenRouter, DeepSeek и т. п. Наш промпт "
@@ -1754,7 +1775,8 @@ class App(ctk.CTk):
         self.pastes_box.bind("<KeyRelease>", lambda e: self.update_pastes_count())
 
         self.backend_frames = {"claude_code": cc, "api": api, "gemini_cli": gc, "gemini_api": ga,
-                               "codex": cx, "openai_api": oa, "openai_compat": lm, "pastes": ps}
+                               "codex": cx, "openai_api": oa, "zai": za, "openai_compat": lm, "pastes": ps}
+        self.bind("<FocusIn>", lambda e: self.zai_paste_key(), add="+")
 
         # Общее для всех нейросетей — без нейросети не нужно, прячется в show_backend
         self.ai_common = ctk.CTkFrame(ai, fg_color="transparent")
@@ -1891,6 +1913,31 @@ class App(ctk.CTk):
 
     # --- выбор способа подключения к нейросети ---
 
+    def zai_paste_key(self):
+        """Ключ Z.ai, скопированный на сайте, сам попадает в поле и проверяется, когда пользователь
+        возвращается в окно. Каждое содержимое буфера — один раз: стёртый вручную ключ не вернётся.
+        Уже введённый ключ без спроса не заменяем."""
+        if BACKENDS.get(self.backend.get()) != "zai":
+            return
+        try:
+            clip = self.clipboard_get().strip()
+        except Exception:   # в буфере не текст или он пуст
+            return
+        if clip == getattr(self, "_zai_clip_seen", None):
+            return
+        self._zai_clip_seen = clip
+        e = self.fields["zai_api_key"]
+        old = e.get().strip()
+        if not core.ZAI_KEY_RE.match(clip) or clip == old:
+            return
+        if old and not messagebox.askyesno("Ключ Z.ai", "В буфере обмена другой ключ Z.ai. "
+                                                        "Заменить им ключ этого аккаунта?"):
+            return
+        e.delete(0, "end")
+        e.insert(0, clip)
+        log.info("Ключ Z.ai вставлен из буфера обмена")
+        self.zai_block.check()
+
     def check_compat(self):
         cfg = dict(self.cfg, compat_base_url=self.fields["compat_base_url"].get().strip(),
                    compat_api_key=self.fields["compat_api_key"].get().strip(),
@@ -1997,6 +2044,7 @@ class App(ctk.CTk):
         self.codex_model.set(c.get("codex_model") or DEFAULT_MODEL)
         self.openai_api_model.set(c.get("openai_api_model") or core.OPENAI_API_DEFAULT)
         self.compat_model.set(c.get("compat_model") or "")
+        self.zai_model.set(c.get("zai_model") or core.ZAI_MODELS[0])
         self.backend.set(next(k for k, v in BACKENDS.items() if v == c.get("backend", "claude_code")))
         self.show_backend()
         self.see_sw.select() if c["send_post_images"] else self.see_sw.deselect()
@@ -2094,6 +2142,8 @@ class App(ctk.CTk):
         new["compat_base_url"] = f["compat_base_url"]
         new["compat_api_key"] = f["compat_api_key"]
         new["compat_model"] = self.compat_model.get().strip()
+        new["zai_api_key"] = f["zai_api_key"]
+        new["zai_model"] = self.zai_model.get().strip() or core.ZAI_MODELS[0]
         try:
             chance = float(self.chance.get().strip().rstrip("%").replace(",", ".") or "nan")
         except ValueError:
