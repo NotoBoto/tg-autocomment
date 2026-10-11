@@ -39,10 +39,10 @@ STATUS = {
 BTN_COLOR = ctk.ThemeManager.theme["CTkButton"]["fg_color"]
 BTN_HOVER = ctk.ThemeManager.theme["CTkButton"]["hover_color"]
 LABEL_W = 270  # ширина колонки подписей в блоке «Нейросеть»
-BACKENDS = {"Claude Code": "claude_code", "Claude API": "api",
+BACKENDS = {"Z.ai (бесплатно)": "zai", "Claude Code": "claude_code", "Claude API": "api",
             "Antigravity (Google)": "gemini_cli", "Gemini API": "gemini_api",
             "ChatGPT (Codex)": "codex", "OpenAI API": "openai_api",
-            "Z.ai (бесплатно)": "zai", "Своя модель": "openai_compat", "Без нейросети": "pastes"}
+            "Своя модель": "openai_compat", "Без нейросети": "pastes"}
 DEFAULT_MODEL = "(по умолчанию)"
 PROXY_MODES = {"Системный (из VPN)": "system", "Свой": "custom", "Без прокси": "none"}
 MODE_CONFIRM, MODE_AUTO = "Подтверждать вручную", "Публиковать сами"
@@ -1547,9 +1547,9 @@ class App(ctk.CTk):
         self.welcome = ctk.CTkFrame(sf, fg_color=("#e3f0ff", "#1d2f44"))
         ctk.CTkLabel(self.welcome, justify="left", anchor="w", wraplength=900, text=(
             "👋  Добро пожаловать! Для начала работы:\n"
-            "0. В блоке «Нейросеть» выберите способ: Claude Code, Antigravity или ChatGPT (вход в аккаунт, "
-            "кнопка «Установить и войти»), API-ключ Claude/Gemini/OpenAI, Z.ai (бесплатно, работает в России "
-            "без VPN), свою модель (LM Studio, Ollama) "
+            "0. В блоке «Нейросеть» уже выбран Z.ai — бесплатно и без VPN, нужен только ключ (кнопка «Получить "
+            "бесплатный ключ»). Или выберите другой способ: Claude Code, Antigravity или ChatGPT (вход в аккаунт, "
+            "кнопка «Установить и войти»), API-ключ Claude/Gemini/OpenAI, свою модель (LM Studio, Ollama) "
             "или «Без нейросети» — тогда программа постит случайные пасты из вашего списка\n"
             + ("1. API ID и API Hash указывать не нужно — в программу встроен свой ключ\n"
                if core.BUILTIN_TELEGRAM_APP else

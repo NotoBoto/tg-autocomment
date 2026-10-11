@@ -25,7 +25,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.5.7"
+VERSION = "0.5.8"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -61,7 +61,8 @@ DEFAULTS = {
     "proxy_mode": "system",        # прокси для Telegram: system (из VPN/Windows) | custom | none
     "proxy": "",                   # для custom: socks5://…, http://… или ссылка MTProxy
     "channels": [],                # каналы, за которыми следим
-    "backend": "claude_code",      # claude_code | api (Anthropic) | gemini_cli (Antigravity) | gemini_api | codex | openai_api | zai | openai_compat
+    "backend": "zai",              # zai (бесплатно, без VPN) | claude_code | api (Anthropic) | gemini_cli (Antigravity) | gemini_api
+                                   # | codex | openai_api | openai_compat
                                    # | pastes — без нейросети, случайная паста из списка
     "model": "sonnet",
     "api_key": "",
@@ -139,6 +140,8 @@ def load_config() -> dict:
         data = {"profiles": [dict(data, id="main")], "current": "main"}
         if LEGACY_DONE_FILE.exists() and not done_file({"id": "main"}).exists():
             LEGACY_DONE_FILE.rename(done_file({"id": "main"}))
+    if CONFIG_FILE.exists():   # профиль из версии, где выбора нейросети ещё не было, работал через Claude Code
+        data["profiles"] = [p if "backend" in p else dict(p, backend="claude_code") for p in data["profiles"]]
     profiles = [normalize_profile(p) for p in data["profiles"]] or [normalize_profile({"id": "main"})]
     ids = [p["id"] for p in profiles]
     return {"profiles": profiles, "current": data.get("current") if data.get("current") in ids else ids[0],
@@ -985,6 +988,31 @@ def check_zai_key(cfg) -> tuple[bool, str, list[str]]:
         return True, f"Ключ работает ✓, но модели {model} больше нет — выбрана {models[0]}. " \
                      "Нажмите «Сохранить»", models
     return True, "Ключ работает ✓ — нажмите «Сохранить»", models
+
+
+# Символы, которых нет на клавиатуре телефона, — сразу выдают нейросеть. Меняем на то, что напечатал бы человек.
+HUMAN_TYPOGRAPHY = str.maketrans({"—": "-", "–": "-", "−": "-", "«": '"', "»": '"', "„": '"', "“": '"',
+                                  "”": '"', "’": "'", "‘": "'", "…": "...", "×": "x",
+                                  "\u00a0": " ", "\u202f": " ", "\u2009": " "})
+
+
+def human_typography(text: str) -> str:
+    """Длинные тире, ёлочки, многоточие одним знаком, × и неразрывные пробелы — в обычные символы."""
+    return text.translate(HUMAN_TYPOGRAPHY) if text else text
+
+
+def copies_post(text: str, post: str) -> bool:
+    """Ответ — в основном куски поста дословно (от 20 символов подряд), а не свой комментарий.
+    Считаем каждый символ ответа, попавший в такой кусок: модель бывает повторяет пост и дважды."""
+    a, b = " ".join(text.lower().split()), " ".join(post.lower().split())
+    n = 20
+    if len(a) < 2 * n or not b:
+        return False
+    covered = bytearray(len(a))
+    for i in range(len(a) - n + 1):
+        if a[i:i + n] in b:
+            covered[i:i + n] = b"\1" * n
+    return sum(covered) > len(a) / 2
 
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)   # «размышления» DeepSeek-R1, Qwen3 и т. п.
@@ -1996,7 +2024,13 @@ class Engine:
                    "gemini_api": self._gen_gemini_api, "codex": self._gen_codex,
                    "openai_api": self._gen_openai_api, "zai": self._gen_zai,
                    "openai_compat": self._gen_compat}.get(self.cfg.get("backend"), self._gen_claude_code)
-            text = await gen(system, user_msg, images)
+            text = human_typography(await gen(system, user_msg, images))
+            if text and copies_post(text, post_text):   # слабые модели иногда переписывают пост — пробуем ещё раз
+                self.log.warning("Нейросеть переписала текст поста вместо комментария — прошу ещё раз")
+                text = human_typography(await gen(system, user_msg, images))
+                if text and copies_post(text, post_text):
+                    raise RuntimeError("нейросеть дважды переписала текст поста вместо комментария — "
+                                       "перегенерируйте или возьмите модель посильнее")
             if not text or text.upper().startswith("SKIP"):
                 return None
             return text
