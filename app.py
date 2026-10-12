@@ -1585,34 +1585,29 @@ class App(ctk.CTk):
         tg = section("Telegram")
         self.settings_first = tg
         builtin = core.BUILTIN_TELEGRAM_APP is not None
-        field(tg, 2, "api_id", "API ID", "необязательно — пусто: встроенный ключ" if builtin else "",
-              width=200, placeholder_text="встроенный" if builtin else "")
-        hash_e = field(tg, 3, "api_hash", "API Hash", show="•",
-                       placeholder_text="встроенный" if builtin else "")
-        ctk.CTkButton(tg, text="показать", width=80, fg_color=GRAY, hover_color=GRAY_HOVER,
-                      command=lambda: hash_e.configure(show="" if hash_e.cget("show") else "•")
-                      ).grid(row=3, column=2, sticky="w", padx=10)
-        ctk.CTkButton(tg, text=("Свой ключ (по желанию) → my.telegram.org" if builtin
-                                else "Где взять API ID и Hash → my.telegram.org"), fg_color="transparent",
-                      text_color=("#1f6aa5", "#5aa9e6"), hover=False, anchor="w",
-                      command=lambda: webbrowser.open("https://my.telegram.org/apps")
-                      ).grid(row=4, column=1, sticky="w")
+
+        def key_fields(f, row):
+            """API ID и Hash. Со встроенным ключом их можно не трогать — тогда они в «Продвинутых»."""
+            field(f, row, "api_id", "API ID", "необязательно — пусто: встроенный ключ" if builtin else "",
+                  width=200, placeholder_text="встроенный" if builtin else "")
+            hash_e = field(f, row + 1, "api_hash", "API Hash", show="•",
+                           placeholder_text="встроенный" if builtin else "")
+            ctk.CTkButton(f, text="показать", width=80, fg_color=GRAY, hover_color=GRAY_HOVER,
+                          command=lambda: hash_e.configure(show="" if hash_e.cget("show") else "•")
+                          ).grid(row=row + 1, column=2, sticky="w", padx=10)
+            ctk.CTkButton(f, text=("Свой ключ (по желанию) → my.telegram.org" if builtin
+                                   else "Где взять API ID и Hash → my.telegram.org"), fg_color="transparent",
+                          text_color=("#1f6aa5", "#5aa9e6"), hover=False, anchor="w",
+                          command=lambda: webbrowser.open("https://my.telegram.org/apps")
+                          ).grid(row=row + 2, column=1, sticky="w")
+        if not builtin:
+            key_fields(tg, 2)
         ctk.CTkLabel(tg, text="Каналы").grid(row=5, column=0, sticky="nw", padx=14, pady=8)
         self.channels_box = ctk.CTkTextbox(tg, height=116)
-        self.channels_box.grid(row=5, column=1, sticky="ew", padx=4, pady=5)
+        self.channels_box.grid(row=5, column=1, sticky="ew", padx=4, pady=(5, 12))
         ctk.CTkLabel(tg, text="по одному на строку:\nusername, @username\nили ссылка t.me/…\n"
                               "закрытый — приглашение\nt.me/+… или ссылка на\nего пост t.me/c/…",
                      text_color="gray", justify="left").grid(row=5, column=2, sticky="nw", padx=10, pady=5)
-        field(tg, 6, "session_name", "Имя файла сессии", "менять не нужно", width=200)
-        ctk.CTkLabel(tg, text="Прокси").grid(row=7, column=0, sticky="w", padx=14, pady=5)
-        self.proxy_mode = ctk.CTkSegmentedButton(tg, values=list(PROXY_MODES),
-                                                 command=lambda v: self.show_proxy())
-        self.proxy_mode.grid(row=7, column=1, sticky="w", padx=4)
-        self.proxy_entry = ctk.CTkEntry(tg, placeholder_text="socks5://127.0.0.1:10808, http://… "
-                                                             "или ссылка t.me/proxy?…")
-        self.fields["proxy"] = self.proxy_entry
-        self.proxy_hint = ctk.CTkLabel(tg, text="", text_color="gray", justify="left", wraplength=640)
-        self.proxy_hint.grid(row=9, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 10))
 
         ai = section("Нейросеть")
         ai.grid_columnconfigure(0, minsize=LABEL_W)
@@ -1814,7 +1809,7 @@ class App(ctk.CTk):
         au.grid_columnconfigure(0, minsize=LABEL_W)
         ctk.CTkLabel(au, text="Публикация").grid(row=2, column=0, sticky="w", padx=14, pady=5)
         self.publish_mode = ctk.CTkSegmentedButton(au, values=list(PUBLISH_MODES),
-                                                   command=lambda v: self.show_publish_mode())
+                                                   command=lambda v: self.on_publish_mode())
         self.publish_mode.grid(row=2, column=1, sticky="w", padx=4)
 
         def sub_au(hint):
@@ -1839,12 +1834,6 @@ class App(ctk.CTk):
         # Без нейросети заготовки не нужны: паста готова сразу
         ins_pastes = sub_au("Паста публикуется сразу под новым постом — без паузы и без очереди")
         self.publish_frames = {"delayed": dl, "instant": ins, "instant_pastes": ins_pastes}
-
-        fl = section("Стоп-слова",
-                     "Посты с этими словами пропускаются без генерации. По одному на строку; "
-                     "достаточно начала слова («погиб» поймает «погибли»)")
-        self.keywords = ctk.CTkTextbox(fl, height=150)
-        self.keywords.grid(row=2, column=0, columnspan=3, sticky="ew", padx=14, pady=(6, 12))
 
         wn = section("Программа", "Общее для всех аккаунтов")
         self.tray_sw = ctk.CTkSwitch(wn, text="При закрытии окна сворачивать в трей — программа продолжает "
@@ -1876,6 +1865,33 @@ class App(ctk.CTk):
                       command=lambda: self.check_updates(manual=True)).pack(side="left", padx=12)
         self.update_check_lbl = ctk.CTkLabel(ver, text="", text_color="gray")
         self.update_check_lbl.pack(side="left")
+
+        # --- продвинутые настройки: большинству не нужны, свёрнуты ---
+        self.adv_btn = ctk.CTkButton(sf, text="", anchor="w", fg_color="transparent", hover=False,
+                                     text_color=("#1f6aa5", "#5aa9e6"), font=ctk.CTkFont(size=14, weight="bold"),
+                                     command=self.toggle_advanced)
+        self.adv_btn.pack(fill="x", padx=4, pady=(6, 0))
+        adv = self.adv_frame = section("Продвинутые настройки", "Обычно менять не нужно")
+        adv.grid_columnconfigure(0, minsize=LABEL_W)
+        if builtin:
+            key_fields(adv, 2)
+        field(adv, 5, "session_name", "Имя файла сессии", "менять не нужно", width=200)
+        ctk.CTkLabel(adv, text="Прокси для Telegram").grid(row=6, column=0, sticky="w", padx=14, pady=5)
+        self.proxy_mode = ctk.CTkSegmentedButton(adv, values=list(PROXY_MODES),
+                                                 command=lambda v: self.show_proxy())
+        self.proxy_mode.grid(row=6, column=1, sticky="w", padx=4)
+        self.proxy_entry = ctk.CTkEntry(adv, placeholder_text="socks5://127.0.0.1:10808, http://… "
+                                                              "или ссылка t.me/proxy?…")
+        self.fields["proxy"] = self.proxy_entry
+        self.proxy_hint = ctk.CTkLabel(adv, text="", text_color="gray", justify="left", wraplength=640)
+        self.proxy_hint.grid(row=8, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 10))
+        ctk.CTkLabel(adv, text="Стоп-слова").grid(row=9, column=0, sticky="nw", padx=14, pady=8)
+        self.keywords = ctk.CTkTextbox(adv, height=150)
+        self.keywords.grid(row=9, column=1, sticky="ew", padx=4, pady=(5, 12))
+        ctk.CTkLabel(adv, text="посты с этими словами\nпропускаются без нейросети;\nпо одному на строку,\n"
+                               "хватит начала слова:\n«погиб» поймает «погибли»",
+                     text_color="gray", justify="left").grid(row=9, column=2, sticky="nw", padx=10, pady=5)
+        self.show_advanced()
 
         bottom = ctk.CTkFrame(tab, fg_color="transparent")
         bottom.pack(fill="x", pady=(6, 0))
@@ -1973,10 +1989,67 @@ class App(ctk.CTk):
             return
         log.info("Автозапуск с Windows %s", "включён" if on else "выключен")
 
+    def show_advanced(self):
+        if self.conf.get("show_advanced"):
+            self.adv_frame.pack(fill="x", padx=4, pady=6, after=self.adv_btn)
+            self.adv_btn.configure(text="▾  Скрыть продвинутые настройки")
+        else:
+            self.adv_frame.pack_forget()
+            self.adv_btn.configure(text="▸  Продвинутые настройки: прокси, ключ Telegram, стоп-слова")
+
+    def toggle_advanced(self):
+        self.conf["show_advanced"] = not self.conf.get("show_advanced")
+        self.save()
+        self.show_advanced()
+
+    def ask_fast_password(self) -> bool:
+        """«Моментально» и паузы меньше MIN_DELAY_SEC — по паролю. Введён один раз — запоминается."""
+        if self.conf.get("fast_unlocked"):
+            return True
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Доступ по паролю")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        ctk.CTkLabel(dlg, justify="left", wraplength=420, text=(
+            f"«Моментально» и паузы меньше {core.MIN_DELAY_SEC} секунд доступны по паролю. "
+            "Введите его — программа запомнит пароль на этом компьютере.")).pack(padx=20, pady=(18, 10))
+        e = ctk.CTkEntry(dlg, show="•", width=300)
+        e.pack(padx=20)
+        msg = ctk.CTkLabel(dlg, text="", text_color=RED)
+        msg.pack(padx=20, pady=(4, 0))
+        ok = [False]
+
+        def submit(_=None):
+            if core.check_fast_password(e.get()):
+                ok[0] = True
+                dlg.destroy()
+            else:
+                msg.configure(text="Пароль не подходит")
+                e.delete(0, "end")
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(padx=20, pady=(8, 16), fill="x")
+        ctk.CTkButton(btns, text="Отмена", width=110, fg_color=GRAY, hover_color=GRAY_HOVER,
+                      command=dlg.destroy).pack(side="right")
+        ctk.CTkButton(btns, text="Открыть доступ", width=150, command=submit).pack(side="right", padx=8)
+        e.bind("<Return>", submit)
+        dlg.after(100, lambda: (dlg.grab_set(), e.focus_set()))
+        self.wait_window(dlg)
+        if ok[0]:
+            self.conf["fast_unlocked"] = True
+            self.save()
+            log.info("Пароль принят: «Моментально» и паузы меньше %s сек доступны", core.MIN_DELAY_SEC)
+            self.show_publish_mode()
+        return ok[0]
+
+    def on_publish_mode(self):
+        if (PUBLISH_MODES.get(self.publish_mode.get()) == "instant" and not self.ask_fast_password()):
+            self.publish_mode.set(next(k for k, v in PUBLISH_MODES.items() if v == "delayed"))
+        self.show_publish_mode()
+
     def show_proxy(self):
         mode = PROXY_MODES.get(self.proxy_mode.get(), "system")
         if mode == "custom":
-            self.proxy_entry.grid(row=8, column=1, sticky="ew", padx=4, pady=5)
+            self.proxy_entry.grid(row=7, column=1, sticky="ew", padx=4, pady=5)
             hint = ("Только для Telegram этого аккаунта: SOCKS5, HTTP или MTProxy (секрет dd…; "
                     "ee… не поддерживается). Нейросети ходят через системный прокси или VPN.")
         else:
@@ -2016,7 +2089,9 @@ class App(ctk.CTk):
         self.delay_frame.hint.configure(text=(
             ("Паста публикуется" if no_ai else "Нейросеть пишет комментарий, и он публикуется")
             + " после случайной паузы — так выглядит естественнее. Пока пауза идёт, комментарий виден "
-              "в «Очереди». Пауза 0 — публикуется сразу, без очереди"))
+              "в «Очереди». "
+            + ("Пауза 0 — публикуется сразу, без очереди" if self.conf.get("fast_unlocked") else
+               f"Пауза — от {core.MIN_DELAY_SEC} секунд; меньше и «Моментально» — по паролю")))
         for key, f in self.publish_frames.items():
             if key == current:
                 f.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 6))
@@ -2113,6 +2188,9 @@ class App(ctk.CTk):
             return False
         if new["delay_min_sec"] > new["delay_max_sec"]:
             new["delay_min_sec"], new["delay_max_sec"] = new["delay_max_sec"], new["delay_min_sec"]
+        if new["delay_min_sec"] < core.MIN_DELAY_SEC and not self.ask_fast_password():
+            messagebox.showerror("Настройки", f"Пауза — не меньше {core.MIN_DELAY_SEC} секунд")
+            return False
         new["api_id"] = int(f["api_id"]) if f["api_id"].isdigit() else f["api_id"]
         new["api_hash"] = f["api_hash"]
         new["channels"] = core.channels({"channels": self.channels_box.get("1.0", "end").splitlines()})
@@ -2154,6 +2232,8 @@ class App(ctk.CTk):
         new["attach_image_chance"] = round(chance / 100, 4)
         new["skip_keywords"] = [w.strip() for w in self.keywords.get("1.0", "end").splitlines() if w.strip()]
         new["publish_mode"] = PUBLISH_MODES.get(self.publish_mode.get(), "delayed")
+        if not self.conf.get("fast_unlocked"):   # «Моментально» выбирается только после пароля
+            new["publish_mode"] = "delayed"
         new["instant_comments"] = [w.strip() for w in self.instant_box.get("1.0", "end").splitlines() if w.strip()]
         new["pastes"] = self.read_pastes()
         if new["backend"] == "pastes" and not new["pastes"]:
@@ -2205,7 +2285,9 @@ class App(ctk.CTk):
             "Инструкция для нейросети: кто вы, какой стиль, что продвигать. Нейросеть получает её "
             "вместе с текстом поста и должна вернуть только текст комментария.\n"
             "Правило «на тяжёлые темы ответь SKIP» добавляется автоматически. "
-            "Пожелания из поля на вкладке «Очередь» приходят строкой «ПОЖЕЛАНИЯ: …»."
+            "Пожелания из поля на вкладке «Очередь» приходят строкой «ПОЖЕЛАНИЯ: …».\n"
+            "{{вариант 1 | вариант 2 | …}} — к каждому комментарию программа подставит случайный вариант: "
+            "так слабые модели не пишут одно и то же."
         )).pack(fill="x", pady=(0, 6))
         self.prompt_box = ctk.CTkTextbox(tab, wrap="word", font=ctk.CTkFont(size=13))
         self.prompt_box.pack(fill="both", expand=True)

@@ -25,7 +25,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.5.8"
+VERSION = "0.5.9"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -129,6 +129,32 @@ MEDIA_FORBIDDEN = (errors.ChatSendMediaForbiddenError, errors.ChatSendPhotosForb
 #               "close_to_tray": bool, "auto_update": bool, "report_fields": [str] | None}.
 # Профиль — один аккаунт Telegram со всеми своими настройками (ключи из DEFAULTS + "id").
 
+# «Моментально» и паузы короче MIN_DELAY_SEC — по паролю: в открытом коде лежит только его хэш
+MIN_DELAY_SEC = 5
+FAST_SALT = bytes.fromhex("00a3e487fecaf4139bca83589943d2da")
+FAST_HASH = bytes.fromhex("7fa2d7754180f32bc65c04c0a1a3d8b84898d31ff06e3515296fa62bcad0d188")
+FAST_ITERATIONS = 600_000   # медленный хэш — перебирать пароль дольше
+
+
+def check_fast_password(password: str) -> bool:
+    import hashlib
+    import hmac
+    got = hashlib.pbkdf2_hmac("sha256", password.encode(), FAST_SALT, FAST_ITERATIONS)
+    return hmac.compare_digest(got, FAST_HASH)
+
+
+def restrict_fast(cfg: dict) -> bool:
+    """Без пароля: публикация с задержкой и паузы от MIN_DELAY_SEC. True — что-то пришлось поменять."""
+    old = (cfg.get("publish_mode"), cfg.get("delay_min_sec"), cfg.get("delay_max_sec"))
+    cfg["publish_mode"] = "delayed"
+    for k in ("delay_min_sec", "delay_max_sec"):
+        try:
+            cfg[k] = max(MIN_DELAY_SEC, int(cfg.get(k, MIN_DELAY_SEC)))
+        except (TypeError, ValueError):
+            cfg[k] = DEFAULTS[k]
+    return old != (cfg["publish_mode"], cfg["delay_min_sec"], cfg["delay_max_sec"])
+
+
 def load_config() -> dict:
     data = {}
     if CONFIG_FILE.exists():
@@ -143,10 +169,18 @@ def load_config() -> dict:
     if CONFIG_FILE.exists():   # профиль из версии, где выбора нейросети ещё не было, работал через Claude Code
         data["profiles"] = [p if "backend" in p else dict(p, backend="claude_code") for p in data["profiles"]]
     profiles = [normalize_profile(p) for p in data["profiles"]] or [normalize_profile({"id": "main"})]
+    fast = bool(data.get("fast_unlocked"))
+    if not fast:
+        for p in profiles:
+            if restrict_fast(p):
+                log.info("Аккаунт «%s»: «Моментально» и паузы меньше %s сек доступны по паролю — "
+                         "включена публикация с задержкой от %s сек", p.get("name"), MIN_DELAY_SEC, MIN_DELAY_SEC)
     ids = [p["id"] for p in profiles]
     return {"profiles": profiles, "current": data.get("current") if data.get("current") in ids else ids[0],
             "close_to_tray": data.get("close_to_tray", True),   # крестик прячет окно в трей
             "auto_update": data.get("auto_update", True),       # ставить новые версии без вопросов
+            "fast_unlocked": fast,                              # введён пароль: «Моментально» и паузы < 5 сек
+            "show_advanced": data.get("show_advanced", False),  # раскрыты «Продвинутые настройки»
             # что включать в текстовый отчёт (ключи REPORT_FIELDS в app.py); None — всё
             "report_fields": data.get("report_fields"),
             # id профилей, работавших перед автообновлением, — их и запустить после него
@@ -990,6 +1024,15 @@ def check_zai_key(cfg) -> tuple[bool, str, list[str]]:
     return True, "Ключ работает ✓ — нажмите «Сохранить»", models
 
 
+VARIANTS_RE = re.compile(r"\{\{(.+?)\}\}", re.S)
+
+
+def pick_variants(prompt: str) -> str:
+    """{{вариант 1 | вариант 2 | …}} в промпте — к каждому запросу случайный вариант. Слабые модели
+    из списка приёмов всегда берут один и тот же, а так комментарии получаются разными."""
+    return VARIANTS_RE.sub(lambda m: random.choice(m.group(1).split("|")).strip(), prompt)
+
+
 # Символы, которых нет на клавиатуре телефона, — сразу выдают нейросеть. Меняем на то, что напечатал бы человек.
 HUMAN_TYPOGRAPHY = str.maketrans({"—": "-", "–": "-", "−": "-", "«": '"', "»": '"', "„": '"', "“": '"',
                                   "”": '"', "’": "'", "‘": "'", "…": "...", "×": "x",
@@ -997,8 +1040,9 @@ HUMAN_TYPOGRAPHY = str.maketrans({"—": "-", "–": "-", "−": "-", "«": '"',
 
 
 def human_typography(text: str) -> str:
-    """Длинные тире, ёлочки, многоточие одним знаком, × и неразрывные пробелы — в обычные символы."""
-    return text.translate(HUMAN_TYPOGRAPHY) if text else text
+    """Длинные тире, ёлочки, многоточие одним знаком, × и неразрывные пробелы — в обычные символы;
+    жирный markdown (**…**) Telegram показал бы звёздочками — убираем."""
+    return text.translate(HUMAN_TYPOGRAPHY).replace("**", "") if text else text
 
 
 def copies_post(text: str, post: str) -> bool:
@@ -1331,7 +1375,7 @@ class Engine:
                                "что VPN включён и адрес прокси верный", proxy_label(proxy), e)
             else:
                 self.log.error("Не удалось подключиться к Telegram: %s — если Telegram у вас "
-                               "заблокирован, включите VPN (см. «Прокси» в «Настройках»)", e)
+                               "заблокирован, включите VPN (см. «Настройки» → «Продвинутые настройки» → «Прокси»)", e)
             return
         if await self.client.is_user_authorized():
             await self._after_login()
@@ -2016,7 +2060,7 @@ class Engine:
         if self.no_ai:   # пожелания пасте не передать — просто другая из колоды, не current
             return self.pick_paste(avoid=current)
         async with self._gen_lock:   # по одному запросу к нейросети за раз
-            system = prompt_path(self.cfg).read_text(encoding="utf-8") + SKIP_RULE
+            system = pick_variants(prompt_path(self.cfg).read_text(encoding="utf-8")) + SKIP_RULE
             user_msg = f"Текст поста:\n\n{post_text or '(текста нет, только медиа)'}"
             if wish.strip():
                 user_msg += f"\n\nПОЖЕЛАНИЯ: {wish.strip()}"
