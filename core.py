@@ -180,6 +180,7 @@ def load_config() -> dict:
             "close_to_tray": data.get("close_to_tray", True),   # крестик прячет окно в трей
             "auto_update": data.get("auto_update", True),       # ставить новые версии без вопросов
             "tray_notify": data.get("tray_notify", False),      # уведомления Windows из трея (у них звук)
+            "sound": data.get("sound", True),                   # свой тихий звук: новый пост ждёт решения
             "fast_unlocked": fast,                              # введён пароль: «Моментально» и паузы < 5 сек
             "show_advanced": data.get("show_advanced", False),  # раскрыты «Продвинутые настройки»
             # что включать в текстовый отчёт (ключи REPORT_FIELDS в app.py); None — всё

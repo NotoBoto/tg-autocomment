@@ -135,6 +135,16 @@ def parse_duration(text: str) -> float | None:
     return sec if 0 < sec <= 7 * 24 * 3600 else None
 
 
+def play_sound():
+    """Свой тихий «дин-дон» (assets/notify.wav) вместо системного звука Windows."""
+    try:
+        import winsound
+        winsound.PlaySound(str(core.RES / "assets" / "notify.wav"),
+                           winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except Exception as e:   # нет звуковой карты, файла и т. п. — молча без звука
+        log.debug("Звук не проигран: %s", e)
+
+
 class Messages:
     """Замена tkinter.messagebox: системные окна Windows всплывают поверх всего и звучат.
     Сообщения — тихая полоса над вкладками, вопросы — тихое окно в стиле программы."""
@@ -1957,8 +1967,17 @@ class App(ctk.CTk):
         if self.conf["tray_notify"]:
             self.notify_sw.select()
         self.notify_sw.grid(row=5, column=0, columnspan=3, sticky="w", padx=14, pady=4)
+        sound = ctk.CTkFrame(wn, fg_color="transparent")
+        sound.grid(row=6, column=0, columnspan=3, sticky="w", padx=14, pady=4)
+        self.sound_sw = ctk.CTkSwitch(sound, text="Тихий звук, когда новый пост ждёт подтверждения или нужен вход",
+                                      command=self.on_sound_switch)
+        if self.conf["sound"]:
+            self.sound_sw.select()
+        self.sound_sw.pack(side="left")
+        ctk.CTkButton(sound, text="▶ Прослушать", width=120, fg_color=GRAY, hover_color=GRAY_HOVER,
+                      command=play_sound).pack(side="left", padx=12)
         ver = ctk.CTkFrame(wn, fg_color="transparent")
-        ver.grid(row=6, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 12))
+        ver.grid(row=7, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 12))
         ctk.CTkLabel(ver, text=f"Версия {core.VERSION}").pack(side="left")
         ctk.CTkButton(ver, text="Проверить обновления", width=170, fg_color=GRAY, hover_color=GRAY_HOVER,
                       command=lambda: self.check_updates(manual=True)).pack(side="left", padx=12)
@@ -2072,6 +2091,10 @@ class App(ctk.CTk):
 
     def on_tray_switch(self):
         self.conf["close_to_tray"] = bool(self.tray_sw.get())
+        self.save()
+
+    def on_sound_switch(self):
+        self.conf["sound"] = bool(self.sound_sw.get())
         self.save()
 
     def on_notify_switch(self):
@@ -3064,6 +3087,8 @@ class App(ctk.CTk):
                 self.show_window()
                 if self.tray:
                     self.tray.notify(f"Аккаунту «{e.cfg['name']}» нужен вход в Telegram")
+            if self.conf["sound"]:
+                play_sound()
             self.login_waiting.append(e.cfg["id"])
             self.next_login()
         elif kind in ("qr", "code_sent", "password_needed", "login_error"):
@@ -3081,6 +3106,8 @@ class App(ctk.CTk):
                 return
             self.tabs.set("Очередь")
             self.render_queue()
+            if self.conf["sound"]:
+                play_sound()
             if self.tray and self.state() == "withdrawn":
                 who = f"«{e.cfg['name']}» · " if len(self.engines) > 1 else ""
                 self.tray.notify(f"{who}Новый пост {data.channel} ждёт подтверждения")

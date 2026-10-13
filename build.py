@@ -84,6 +84,7 @@ def main():
         "--distpath", str(DIST), "--workpath", str(ROOT / "build"), "--specpath", str(ROOT / "build"),
         "--add-data", f"{ROOT / 'prompt.example.txt'}{sep}.",
         "--add-data", f"{ROOT / 'assets' / 'icon.ico'}{sep}assets",
+        "--add-data", f"{ROOT / 'assets' / 'notify.wav'}{sep}assets",
         "--collect-data", "customtkinter",      # темы и шрифты customtkinter
         "--hidden-import", "pystray._win32",    # pystray выбирает бэкенд при запуске
         "--hidden-import", "cryptg",            # Telethon ищет его при запуске; без него шифрует медленно
