@@ -126,7 +126,7 @@ MEDIA_FORBIDDEN = (errors.ChatSendMediaForbiddenError, errors.ChatSendPhotosForb
 
 # ---------- настройки ----------
 # config.json: {"profiles": [профиль, …], "current": id профиля, открытого в окне,
-#               "close_to_tray": bool, "auto_update": bool, "report_fields": [str] | None}.
+#               "close_to_tray": bool, "auto_update": bool, "tray_notify": bool, "report_fields": [str] | None}.
 # Профиль — один аккаунт Telegram со всеми своими настройками (ключи из DEFAULTS + "id").
 
 # «Моментально» и паузы короче MIN_DELAY_SEC — по паролю: в открытом коде лежит только его хэш
@@ -179,6 +179,7 @@ def load_config() -> dict:
     return {"profiles": profiles, "current": data.get("current") if data.get("current") in ids else ids[0],
             "close_to_tray": data.get("close_to_tray", True),   # крестик прячет окно в трей
             "auto_update": data.get("auto_update", True),       # ставить новые версии без вопросов
+            "tray_notify": data.get("tray_notify", False),      # уведомления Windows из трея (у них звук)
             "fast_unlocked": fast,                              # введён пароль: «Моментально» и паузы < 5 сек
             "show_advanced": data.get("show_advanced", False),  # раскрыты «Продвинутые настройки»
             # что включать в текстовый отчёт (ключи REPORT_FIELDS в app.py); None — всё

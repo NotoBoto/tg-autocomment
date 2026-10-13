@@ -17,7 +17,8 @@ import zlib
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
+from tkinter import messagebox as tk_messagebox
 
 import customtkinter as ctk
 import qrcode
@@ -134,6 +135,34 @@ def parse_duration(text: str) -> float | None:
     return sec if 0 < sec <= 7 * 24 * 3600 else None
 
 
+class Messages:
+    """Замена tkinter.messagebox: системные окна Windows всплывают поверх всего и звучат.
+    Сообщения — тихая полоса над вкладками, вопросы — тихое окно в стиле программы."""
+    app: "App | None" = None   # окно программы регистрирует себя при создании
+
+    def _say(self, kind, title, text):
+        if self.app:
+            self.app.say(kind, title, text)
+
+    def showinfo(self, title, text):
+        self._say("info", title, text)
+
+    def showwarning(self, title, text):
+        self._say("warning", title, text)
+
+    def showerror(self, title, text):
+        self._say("error", title, text)
+
+    def askyesno(self, title, text) -> bool:
+        return bool(self.app) and self.app.ask(title, text, "Да", "Нет")
+
+    def askokcancel(self, title, text) -> bool:
+        return bool(self.app) and self.app.ask(title, text, "ОК", "Отмена")
+
+
+messagebox = Messages()   # вызывается так же, как tkinter.messagebox
+
+
 def open_path(p: Path):
     os.startfile(str(p))  # Windows
 
@@ -247,6 +276,8 @@ class Tray:
         self.icon.update_menu()
 
     def notify(self, text: str):
+        if not self.app.conf.get("tray_notify"):   # у уведомлений Windows звук — по умолчанию выключены
+            return
         try:
             self.icon.notify(text, "TG Автокомментатор")
         except Exception:
@@ -623,6 +654,14 @@ class App(ctk.CTk):
         for sf in (self.settings_sf, self.list_frame):
             repaint_after_scroll(sf)
         fix_hotkeys_any_layout(self)
+        # Сообщения программы — здесь, а не системными окнами со звуком (см. Messages)
+        self.notice = ctk.CTkFrame(self)
+        self.notice_lbl = ctk.CTkLabel(self.notice, text="", anchor="w", justify="left", wraplength=980)
+        self.notice_lbl.pack(side="left", fill="x", expand=True, padx=12, pady=6)
+        ctk.CTkButton(self.notice, text="✕", width=32, fg_color="transparent", hover_color=GRAY_HOVER,
+                      text_color=("gray20", "gray80"), command=self.hide_notice).pack(side="right", padx=6)
+        self.notice_timer = None
+        messagebox.app = self
         self.statusbar = ctk.CTkLabel(self, text="", anchor="w", text_color="gray")
         self.statusbar.pack(fill="x", padx=16, pady=(0, 6))
 
@@ -633,6 +672,7 @@ class App(ctk.CTk):
             self.tray = None
             log.warning("Значок в трее недоступен: %s", e)
             self.tray_sw.configure(state="disabled")
+            self.notify_sw.configure(state="disabled")
         self.render_status()
         self.render_queue()
         if first_run:
@@ -1911,8 +1951,14 @@ class App(ctk.CTk):
         if not core.FROZEN:
             self.auto_update_sw.configure(state="disabled",
                                           text="Автообновление — только в установленной версии (из установщика)")
+        self.notify_sw = ctk.CTkSwitch(wn, text="Уведомления Windows, когда окно свёрнуто в трей: новый пост ждёт "
+                                                "подтверждения, нужен вход и т. п. (со звуком Windows)",
+                                       command=self.on_notify_switch)
+        if self.conf["tray_notify"]:
+            self.notify_sw.select()
+        self.notify_sw.grid(row=5, column=0, columnspan=3, sticky="w", padx=14, pady=4)
         ver = ctk.CTkFrame(wn, fg_color="transparent")
-        ver.grid(row=5, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 12))
+        ver.grid(row=6, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 12))
         ctk.CTkLabel(ver, text=f"Версия {core.VERSION}").pack(side="left")
         ctk.CTkButton(ver, text="Проверить обновления", width=170, fg_color=GRAY, hover_color=GRAY_HOVER,
                       command=lambda: self.check_updates(manual=True)).pack(side="left", padx=12)
@@ -2028,6 +2074,10 @@ class App(ctk.CTk):
         self.conf["close_to_tray"] = bool(self.tray_sw.get())
         self.save()
 
+    def on_notify_switch(self):
+        self.conf["tray_notify"] = bool(self.notify_sw.get())
+        self.save()
+
     def on_auto_update_switch(self):
         self.conf["auto_update"] = bool(self.auto_update_sw.get())
         self.save()
@@ -2054,6 +2104,50 @@ class App(ctk.CTk):
         self.conf["show_advanced"] = not self.conf.get("show_advanced")
         self.save()
         self.show_advanced()
+
+    NOTICE_COLORS = {"info": ("#e3f0ff", "#1d2f44"), "warning": ("#fff4d6", "#463a17"),
+                     "error": ("#ffe1e1", "#4a2020")}
+
+    def say(self, kind: str, title: str, text: str):
+        """Тихое сообщение над вкладками. Обычное само скрывается, предупреждение и ошибка — висят до ✕."""
+        self.notice.configure(fg_color=self.NOTICE_COLORS[kind])
+        self.notice_lbl.configure(text=f"{title}:  {text}" if title else text)
+        self.notice.pack(fill="x", padx=12, pady=(0, 6), before=self.tabs)
+        if self.notice_timer:
+            self.after_cancel(self.notice_timer)
+        self.notice_timer = self.after(10000, self.hide_notice) if kind == "info" else None
+
+    def hide_notice(self):
+        if self.notice_timer:
+            self.after_cancel(self.notice_timer)
+            self.notice_timer = None
+        self.notice.pack_forget()
+
+    def ask(self, title: str, text: str, yes: str, no: str) -> bool:
+        """Вопрос «да/нет» своим окном — без звука Windows. Enter — да, Esc — нет."""
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(title)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        ctk.CTkLabel(dlg, text=text, justify="left", wraplength=460).pack(padx=20, pady=(18, 12))
+        answer = [False]
+
+        def done(value):
+            answer[0] = value
+            dlg.destroy()
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(padx=20, pady=(0, 16), fill="x")
+        ctk.CTkButton(btns, text=no, width=110, fg_color=GRAY, hover_color=GRAY_HOVER,
+                      command=lambda: done(False)).pack(side="right")
+        ctk.CTkButton(btns, text=yes, width=110, command=lambda: done(True)).pack(side="right", padx=8)
+        dlg.bind("<Return>", lambda e: done(True))
+        dlg.bind("<Escape>", lambda e: done(False))
+        dlg.update_idletasks()
+        dlg.geometry(f"+{self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2}"
+                     f"+{self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3}")
+        dlg.after(100, lambda: (dlg.grab_set(), dlg.focus_set()))
+        self.wait_window(dlg)
+        return answer[0]
 
     def ask_fast_password(self) -> bool:
         """«Моментально» и паузы меньше MIN_DELAY_SEC — по паролю. Введён один раз — запоминается."""
@@ -2987,7 +3081,6 @@ class App(ctk.CTk):
                 return
             self.tabs.set("Очередь")
             self.render_queue()
-            self.bell()
             if self.tray and self.state() == "withdrawn":
                 who = f"«{e.cfg['name']}» · " if len(self.engines) > 1 else ""
                 self.tray.notify(f"{who}Новый пост {data.channel} ждёт подтверждения")
@@ -3067,7 +3160,7 @@ def run():
             updated="--updated" in args, instance=instance).mainloop()
     except Exception as e:
         logging.getLogger("autocomment").exception("Сбой")
-        messagebox.showerror("TG Автокомментатор", f"Программа упала:\n{e}\n\nПодробности в log.txt")
+        tk_messagebox.showerror("TG Автокомментатор", f"Программа упала:\n{e}\n\nПодробности в log.txt")
         raise
 
 
