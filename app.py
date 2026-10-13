@@ -136,7 +136,7 @@ def parse_duration(text: str) -> float | None:
 
 
 def play_sound():
-    """Свой тихий «дин-дон» (assets/notify.wav) вместо системного звука Windows."""
+    """Свой тихий деревянный «тук-тук» (assets/notify.wav) вместо системного звука Windows."""
     try:
         import winsound
         winsound.PlaySound(str(core.RES / "assets" / "notify.wav"),
