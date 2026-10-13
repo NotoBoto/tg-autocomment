@@ -110,15 +110,25 @@ def fmt_left(seconds: float) -> str:
     return f"{h}:{m:02}:{s % 60:02}" if h else f"{m}:{s % 60:02}"
 
 
+DURATION_UNITS = {"с": 1, "сек": 1, "s": 1, "м": 60, "мин": 60, "m": 60, "ч": 3600, "час": 3600, "h": 3600}
+
+
 def parse_duration(text: str) -> float | None:
-    """Сколько добавить: «20» — минуты, «1,5» — полторы минуты, «1:30» — час тридцать. None — не разобрать."""
+    """Сколько ждать: «20» — минуты, «1,5» — полторы минуты, «1:30» — час тридцать,
+    «30 сек», «5м», «2ч». None — не разобрать."""
     t = text.strip().lower().replace(",", ".")
     try:
         if ":" in t:
             h, m = t.split(":", 1)
             sec = (int(h or 0) * 60 + int(m or 0)) * 60
         else:
-            sec = float(t) * 60
+            m = re.fullmatch(r"([\d.]+)\s*([^\d\s.]*)\.?", t)
+            unit = m and m[2]
+            mult = DURATION_UNITS.get(unit[:3] if unit and unit.startswith(("сек", "мин", "час")) else unit,
+                                      60 if m and not unit else None)
+            if mult is None:
+                return None
+            sec = float(m[1]) * mult
     except ValueError:
         return None
     return sec if 0 < sec <= 7 * 24 * 3600 else None
@@ -1294,6 +1304,27 @@ class App(ctk.CTk):
         self.sched_msg = ctk.CTkLabel(self.sched, text="", text_color=RED)
         self.sched_msg.grid(row=1, column=6, padx=(8, 12), pady=(2, 10), sticky="w")
 
+        # Подтвердить сейчас, а опубликовать через время — у постов из ручного режима и по ссылке тоже
+        later = ctk.CTkFrame(d, fg_color="transparent")
+        later.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.later_lbl = ctk.CTkLabel(later, text="Опубликовать через:")
+        self.later_lbl.grid(row=0, column=0, padx=(0, 6))
+        self.later_btns = []
+        for i, (label, sec) in enumerate((("30 сек", 30), ("5 мин", 300), ("15 мин", 900),
+                                          ("1 час", 3600))):
+            b = ctk.CTkButton(later, text=label, width=64, fg_color=GRAY, hover_color=GRAY_HOVER,
+                              command=lambda s=sec: self.publish_later(s))
+            b.grid(row=0, column=1 + i, padx=2)
+            self.later_btns.append(b)
+        self.later_entry = ctk.CTkEntry(later, width=100, placeholder_text="45 сек, 20, 1:30")
+        self.later_entry.grid(row=0, column=5, padx=(10, 2))
+        self.later_entry.bind("<Return>", lambda e: self.publish_later_custom())
+        b = ctk.CTkButton(later, text="Назначить", width=90, command=self.publish_later_custom)
+        b.grid(row=0, column=6, padx=2)
+        self.later_btns += [b, self.later_entry]
+        self.later_msg = ctk.CTkLabel(later, text="", text_color=RED)
+        self.later_msg.grid(row=0, column=7, padx=(8, 0), sticky="w")
+
         actions = ctk.CTkFrame(d, fg_color="transparent")
         actions.grid(row=8, column=0, columnspan=2, sticky="ew")
         self.publish_btn = ctk.CTkButton(actions, text="✓  Опубликовать", height=42,
@@ -1458,19 +1489,24 @@ class App(ctk.CTk):
             self.sched.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 8))
             self.publish_btn.configure(text="✓  Опубликовать сейчас")
             self.skip_btn.configure(text="✕  Отменить публикацию")
+            self.later_lbl.configure(text="Перенести: через")
         else:
             self.sched.grid_forget()
             self.publish_btn.configure(text="✓  Опубликовать")
             self.skip_btn.configure(text="Пропустить пост")
+            self.later_lbl.configure(text="Опубликовать через:")
+        self.later_msg.configure(text="")
         st = "disabled" if p.busy else "normal"
-        for b in (self.publish_btn, self.skip_btn, self.regen_btn, *self.img_btns, *self.sched_btns):
+        for b in (self.publish_btn, self.skip_btn, self.regen_btn, *self.img_btns, *self.sched_btns,
+                  *self.later_btns):
             b.configure(state=st)
         self.comment_box.configure(state=st)
         no_ai = self.owner(p).no_ai
         self.wish.grid_remove() if no_ai else self.wish.grid()
         self.regen_btn.configure(text="↻  Другая паста" if no_ai else "↻  Новый вариант")
         if not p.comment and not p.busy:
-            self.publish_btn.configure(state="disabled")
+            for b in (self.publish_btn, *self.later_btns):
+                b.configure(state="disabled")
 
     def show_image(self, p: Pending):
         img = thumbnail(p.image, 220)
@@ -1510,14 +1546,31 @@ class App(ctk.CTk):
             self.owner(p).regenerate(p.key, self.wish.get())
             self.wish.delete(0, "end")
 
+    def comment_text(self, p: Pending) -> str | None:
+        # Публикуем только текст этого поста: если в поле почему-то чужой — берём его собственный
+        text = (self.comment_box.get("1.0", "end-1c") if self.comment_uid == p.uid else p.comment).strip()
+        if not text:
+            messagebox.showwarning("Пусто", "Комментарий пустой")
+            return None
+        return text
+
     def publish(self):
-        if p := self.current():
-            # Публикуем только текст этого поста: если в поле почему-то чужой — берём его собственный
-            text = (self.comment_box.get("1.0", "end-1c") if self.comment_uid == p.uid else p.comment).strip()
-            if not text:
-                messagebox.showwarning("Пусто", "Комментарий пустой")
-                return
+        if (p := self.current()) and (text := self.comment_text(p)):
             self.owner(p).publish(p.key, text, p.image)
+
+    def publish_later(self, seconds: float):
+        if (p := self.current()) and (text := self.comment_text(p)):
+            self.save_draft()
+            self.owner(p).schedule(p.key, text, p.image, seconds)
+
+    def publish_later_custom(self):
+        seconds = parse_duration(self.later_entry.get())
+        if seconds is None:
+            self.later_msg.configure(text="30 сек, 5 мин, 20 (минуты) или 1:30")
+            return
+        self.later_msg.configure(text="")
+        self.later_entry.delete(0, "end")
+        self.publish_later(seconds)
 
     def skip(self):
         if p := self.current():

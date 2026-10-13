@@ -25,7 +25,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.5.9"
+VERSION = "0.5.10"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -1097,6 +1097,7 @@ class Pending:
     sent_id: int = 0         # нужен, чтобы заменить заготовку настоящим комментарием
     busy: bool = False       # идёт генерация/отправка
     publish_at: float = 0.0  # автопубликация по таймеру: когда (time.time()); 0 — ждёт решения человека
+    user_timer: bool = False # таймер назначил человек («Опубликовать через…») — смена режима его не снимает
     error: str = ""
     source: str = ""         # откуда текст — для отчёта: имя нейросети, «паста», «заготовка»
     generated: str = ""      # текст, выданный программой: отличается от comment — значит, правили вручную
@@ -2556,6 +2557,22 @@ class Engine:
             await self._publish_pending(p)
         self._submit(go())
 
+    def schedule(self, key: str, text: str, image: Path | None, seconds: float):
+        """Подтверждено человеком: опубликовать через seconds. Если таймер уже идёт — переназначить."""
+        async def go():
+            p = self.pending.get(key)
+            if not p or p.busy:
+                return
+            running = bool(p.publish_at)   # таймер уже ждёт в _wait_schedule — второй не нужен
+            p.comment, p.image, p.error = text.strip(), image, ""
+            p.publish_at, p.user_timer = time.time() + seconds, True
+            self.log.info("Пост #%s: публикация назначена на %s", p.post_id,
+                          time.strftime("%H:%M:%S", time.localtime(p.publish_at)))
+            self._emit("pending_update", p)
+            if not running and await self._wait_schedule(p):
+                await self._publish_pending(p)
+        self._submit(go())
+
     def postpone(self, key: str, seconds: float):
         """Добавить seconds ко времени автопубликации."""
         async def go():
@@ -2571,7 +2588,7 @@ class Engine:
     def hold_scheduled(self):
         """Режим сменили на ручное подтверждение — ничего не публиковать самим."""
         async def go():
-            held = [p for p in self.pending.values() if p.publish_at]
+            held = [p for p in self.pending.values() if p.publish_at and not p.user_timer]
             for p in held:
                 p.publish_at = 0
                 self._emit("pending_update", p)
