@@ -1605,7 +1605,8 @@ class Engine:
     async def _collect_post(self, msg, wait=True):
         """Возвращает (id для коммента, текст, список сообщений с медиа). Склеивает альбомы."""
         if not msg.grouped_id:
-            return msg.id, msg.raw_text or "", [msg]
+            text = "\n\n".join(t for t in (msg.raw_text, self._poll_text(msg)) if t)
+            return msg.id, text, [msg]
         # Альбом публикуется целиком, на сервере все части есть сразу; пауза — запас на случай
         # задержек. Моментальному режиму важнее скорость
         if wait:
@@ -1616,6 +1617,33 @@ class Engine:
                        key=lambda m: m.id)
         text = next((m.raw_text for m in parts if m.raw_text), "")
         return parts[0].id, text, parts
+
+    @staticmethod
+    def _poll_text(msg) -> str:
+        """Опрос как текст: вопрос, варианты и, если уже голосовали, проценты — у поста-опроса
+        нет обычного текста, без этого он пропускался бы."""
+        media = getattr(msg, "poll", None)
+        if not media:
+            return ""
+
+        def plain(t):   # в новых версиях Telegram — TextWithEntities, в старых — строка
+            return getattr(t, "text", t) or ""
+
+        poll = media.poll
+        votes, total = {}, 0
+        results = media.results
+        # Голоса бывают скрыты до закрытия опроса — тогда без процентов
+        if (results and results.results and results.total_voters
+                and all(r.voters is not None for r in results.results)):
+            total = results.total_voters
+            votes = {r.option: r.voters for r in results.results}
+        lines = [f"Опрос: {plain(poll.question)}"]
+        for a in poll.answers:
+            share = f" — {round(votes.get(a.option, 0) * 100 / total)}%" if total else ""
+            lines.append(f"• {plain(a.text)}{share}")
+        if total:
+            lines.append(f"Проголосовали: {total}")
+        return "\n".join(lines)
 
     async def _download_post_images(self, parts, folder: Path) -> list[Path]:
         """Качает фото (и превью видео) из поста во временную папку поста."""
