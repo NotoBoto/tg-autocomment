@@ -97,9 +97,14 @@ DEFAULTS = {
 
 log = logging.getLogger("autocomment")
 
+class CommentsClosedError(Exception):
+    """Комментарий ушёл в группу обсуждения, но не под пост: копию поста в группе уже удалили."""
+
+
 # Почему Telegram не принял комментарий — по-человечески
 SEND_ERRORS = {
     errors.MsgIdInvalidError: "У поста нет обсуждения (комментарии выключены)",
+    CommentsClosedError: "Комментарии к посту закрыты",
     errors.ChatWriteForbiddenError: "Аккаунту нельзя писать в группе обсуждения",
     errors.ChatGuestSendForbiddenError: "Писать в обсуждении могут только участники группы — "
                                         "вступите в неё этим аккаунтом",
@@ -1095,6 +1100,7 @@ class Pending:
     plain_forbidden: bool = False   # отправка без картинки получила отказ: в обсуждении так нельзя
     reply_peer: object = None   # группа обсуждения и id поста в ней — из проверки прав,
     reply_to: int = 0           # чтобы отправка не спрашивала их у Telegram ещё раз
+    thread_at: float = 0.0      # когда их узнали (time.monotonic()) — давно, значит, перед отправкой спросить заново
     sent_chat: int = 0       # где и под каким id опубликован (группа обсуждения) —
     sent_id: int = 0         # нужен, чтобы заменить заготовку настоящим комментарием
     busy: bool = False       # идёт генерация/отправка
@@ -1832,6 +1838,7 @@ class Engine:
                 for t in done:
                     if not t.exception():
                         p.reply_peer, p.reply_to = t.result()
+                        p.thread_at = time.monotonic()
                         return True
                     if isinstance(t.exception(), errors.MsgIdInvalidError):   # обсуждения у поста нет
                         return False
@@ -1864,6 +1871,7 @@ class Engine:
         if isinstance(group, types.ChannelForbidden):
             return "аккаунт забанен в группе обсуждения"
         p.reply_peer, p.reply_to = utils.get_input_peer(group), top.id
+        p.thread_at = time.monotonic()
         # У «min»-версии канала личные права недостоверны; админам ограничения не страшны
         if not isinstance(group, types.Channel) or group.min or group.creator or group.admin_rights:
             return ""
@@ -2513,6 +2521,10 @@ class Engine:
             self.log.info("Пост #%s: комментарий длиннее %d символов и в подпись к картинке не помещается — "
                           "публикую без картинки", p.post_id, CAPTION_LIMIT)
             p.image = None
+        if p.reply_peer and time.monotonic() - p.thread_at > 10:
+            # Пост ждал в очереди: за это время комментарии могли закрыть. Без запомненной группы
+            # отправка заново спросит у Telegram обсуждение поста и, если его уже нет, получит отказ
+            p.reply_peer = None
         started = time.perf_counter()
         try:
             try:
@@ -2524,6 +2536,15 @@ class Engine:
                                  p.post_id)
                 p.image = None
                 sent = await self._with_flood_wait(lambda: self._send_once(p))
+            if p.reply_peer and getattr(sent.reply_to, "reply_to_msg_id", None) != p.reply_to:
+                # Копию поста в группе удалили (комментарии закрыли) уже после проверки. Telegram
+                # не отказывает, а публикует сообщение просто в группе — без поста оно бессмысленно
+                try:
+                    await self.client.delete_messages(sent.chat_id, [sent.id])
+                except Exception as e:
+                    self.log.error("Пост #%s: комментарий ушёл в группу без привязки к посту, "
+                                   "удалить его не удалось: %s", p.post_id, e)
+                raise CommentsClosedError
         except errors.ChatSendPlainForbiddenError as e:
             p.plain_forbidden = True
             p.error = send_error_text(e)
