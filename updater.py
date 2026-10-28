@@ -6,6 +6,7 @@
 """
 import hashlib
 import json
+import ssl
 import subprocess
 import tempfile
 import urllib.error
@@ -13,11 +14,20 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+import certifi
+
 import core
 
 API = f"https://api.github.com/repos/{core.REPO}/releases/latest"
 ASSET_SUFFIX = "-Setup.exe"   # TG-Autocomment-0.1.0-Setup.exe
 HEADERS = {"Accept": "application/vnd.github+json", "User-Agent": f"tg-autocomment/{core.VERSION}"}
+
+# Корневые сертификаты certifi (идут с программой) плюс хранилище Windows. Одного хранилища мало:
+# Windows докачивает корневые сертификаты по мере надобности, и на части компьютеров нужного там нет —
+# GitHub тогда не открывается с CERTIFICATE_VERIFY_FAILED. Хранилище оставляем ради антивирусов и прокси,
+# которые подменяют сертификаты своим
+SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+SSL_CONTEXT.load_default_certs()
 
 
 @dataclass
@@ -40,7 +50,8 @@ def parse_version(s: str) -> tuple[int, ...]:
 def check() -> Update | None:
     """Новая версия или None. Ошибки сети — исключением (urllib.error.URLError и т. п.)."""
     try:
-        with urllib.request.urlopen(urllib.request.Request(API, headers=HEADERS), timeout=20) as r:
+        with urllib.request.urlopen(urllib.request.Request(API, headers=HEADERS), timeout=20,
+                                    context=SSL_CONTEXT) as r:
             data = json.load(r)
     except urllib.error.HTTPError as e:
         if e.code == 404:   # релизов ещё нет
@@ -63,7 +74,7 @@ def download(u: Update, progress=None) -> Path:
     part = target.with_suffix(".part")
     h, done = hashlib.sha256(), 0
     req = urllib.request.Request(u.url, headers={"User-Agent": HEADERS["User-Agent"]})
-    with urllib.request.urlopen(req, timeout=60) as r, part.open("wb") as f:
+    with urllib.request.urlopen(req, timeout=60, context=SSL_CONTEXT) as r, part.open("wb") as f:
         while chunk := r.read(1 << 16):
             f.write(chunk)
             h.update(chunk)
