@@ -25,7 +25,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.5.13"
+VERSION = "0.5.14"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
@@ -399,6 +399,22 @@ def api_key_error(cfg) -> str:
                 + (" или очистите оба поля, чтобы работать со встроенным ключом" if BUILTIN_TELEGRAM_APP else ""))
     return ("Telegram не принял встроенный ключ программы. Обновите программу («Настройки» → «Программа» → "
             "«Проверить обновления») или укажите свои API ID и API Hash с my.telegram.org")
+
+
+def wait_text(seconds: int) -> str:
+    """40 → «40 с», 125 → «3 мин», 7500 → «2 ч 5 мин» (минуты округляем вверх)."""
+    seconds = max(int(seconds or 0), 0)
+    if seconds < 60:
+        return f"{seconds} с"
+    minutes = -(-seconds // 60)
+    if minutes < 60:
+        return f"{minutes} мин"
+    h, m = divmod(minutes, 60)
+    return f"{h} ч {m} мин" if m else f"{h} ч"
+
+
+def flood_wait_error(e) -> str:
+    return f"Слишком много попыток — Telegram просит подождать {wait_text(e.seconds)} и попробовать снова"
 
 
 def validate(cfg) -> list[str]:
@@ -1406,6 +1422,10 @@ class Engine:
         self.running = False
         self._emit("status", "stopped")
 
+    def _login_error(self, text: str):
+        self.log.warning("Вход в Telegram: %s", text)
+        self._emit("login_error", text)
+
     def send_code(self, phone: str):
         async def go():
             self._phone = phone.strip()
@@ -1413,9 +1433,9 @@ class Engine:
                 await self.client.send_code_request(self._phone)
                 self._emit("code_sent")
             except API_KEY_ERRORS:
-                self._emit("login_error", api_key_error(self.cfg))
+                self._login_error(api_key_error(self.cfg))
             except Exception as e:
-                self._emit("login_error", f"Не удалось отправить код: {e}")
+                self._login_error(f"Не удалось отправить код: {e}")
         self._submit(go())
 
     def sign_in_code(self, code: str):
@@ -1425,21 +1445,41 @@ class Engine:
             except errors.SessionPasswordNeededError:
                 self._emit("password_needed")
                 return
+            except errors.FloodWaitError as e:
+                self._login_error(flood_wait_error(e))
+                return
             except Exception as e:
-                self._emit("login_error", f"Код не подошёл: {e}")
+                self._login_error(f"Код не подошёл: {e}")
                 return
             await self._after_login()
         self._submit(go())
 
     def sign_in_password(self, password: str):
+        if not self.client:   # окно входа открыто, а подключения уже нет
+            return None
+
         async def go():
+            client = self.client
+            # Иначе Telethon молча ждёт FloodWait до минуты, и кажется, что «ничего не происходит»
+            threshold = client.flood_sleep_threshold
+            client.flood_sleep_threshold = 0
             try:
-                await self.client.sign_in(password=password)
-            except Exception as e:
-                self._emit("login_error", f"Пароль не подошёл: {e}")
+                await client.sign_in(password=password)
+            except errors.PasswordHashInvalidError:
+                self._login_error("Неверный облачный пароль. Это пароль двухэтапной аутентификации Telegram, "
+                                  "не код из SMS. Забыли — Telegram → Настройки → Конфиденциальность → "
+                                  "Облачный пароль.")
                 return
+            except errors.FloodWaitError as e:
+                self._login_error(flood_wait_error(e))
+                return
+            except Exception as e:
+                self._login_error(f"Пароль не подошёл: {e}")
+                return
+            finally:
+                client.flood_sleep_threshold = threshold
             await self._after_login()
-        self._submit(go())
+        return self._submit(go())
 
     def start_qr(self):
         async def go():

@@ -315,7 +315,8 @@ class LoginDialog(ctk.CTkToplevel):
 
         head = (f"Профиль «{engine.cfg['name']}»: войдите в аккаунт,\nот имени которого он будет комментировать"
                 if multi else "Войдите в аккаунт, от имени которого\nбудут публиковаться комментарии")
-        ctk.CTkLabel(self, text=head, font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(18, 8))
+        self.head = ctk.CTkLabel(self, text=head, font=ctk.CTkFont(size=15, weight="bold"))
+        self.head.pack(pady=(18, 8))
 
         self.tabs = ctk.CTkTabview(self, height=380)
         self.tabs.pack(fill="both", expand=True, padx=16)
@@ -349,10 +350,18 @@ class LoginDialog(ctk.CTkToplevel):
         # --- общий блок пароля 2FA ---
         self.pw_frame = ctk.CTkFrame(self)
         ctk.CTkLabel(self.pw_frame, text="На аккаунте включён облачный пароль (2FA)").pack(pady=(8, 2))
+        ctk.CTkLabel(self.pw_frame, text="Это пароль двухэтапной аутентификации Telegram, "
+                                         "который вы задавали сами — не код из SMS",
+                     text_color="gray", wraplength=360, justify="center").pack(padx=12, pady=(0, 6))
         self.pw = ctk.CTkEntry(self.pw_frame, show="•", placeholder_text="Облачный пароль")
         self.pw.pack(fill="x", padx=12)
         self.pw.bind("<Return>", lambda e: self.sign_in_pw())
-        ctk.CTkButton(self.pw_frame, text="Войти", command=self.sign_in_pw).pack(fill="x", padx=12, pady=8)
+        self.pw_show = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(self.pw_frame, text="Показать пароль", variable=self.pw_show,
+                        command=lambda: self.pw.configure(show="" if self.pw_show.get() else "•")
+                        ).pack(anchor="w", padx=12, pady=(6, 0))
+        self.pw_btn = ctk.CTkButton(self.pw_frame, text="Войти", command=self.sign_in_pw)
+        self.pw_btn.pack(fill="x", padx=12, pady=8)
 
         self.err = ctk.CTkLabel(self, text="", text_color=RED, wraplength=400)
         self.err.pack(pady=(4, 10))
@@ -376,7 +385,13 @@ class LoginDialog(ctk.CTkToplevel):
         self.engine.sign_in_code(self.code.get())
 
     def sign_in_pw(self):
+        if self.pw_btn.cget("state") == "disabled":   # прошлая попытка ещё проверяется
+            return
+        if not self.pw.get():
+            self.err.configure(text="Введите облачный пароль")
+            return
         self.err.configure(text="")
+        self.pw_btn.configure(state="disabled", text="Проверяю…")
         self.engine.sign_in_password(self.pw.get())
 
     def cancel(self):
@@ -406,11 +421,18 @@ class LoginDialog(ctk.CTkToplevel):
             self.code_frame.pack(fill="x", pady=(4, 0))
             self.code.focus()
         elif kind == "password_needed":
+            # Окно фиксированной высоты: под вкладками блок пароля и ошибка не помещаются
+            self.tabs.pack_forget()
+            self.head.configure(text="Осталось ввести облачный пароль")
             self.pw_frame.pack(fill="x", padx=16, pady=(8, 0), before=self.err)
             self.pw.focus()
         elif kind == "login_error":
             self.code_btn.configure(state="normal", text="Получить код")
+            self.pw_btn.configure(state="normal", text="Войти")
             self.err.configure(text=data)
+            if self.pw_frame.winfo_manager():   # блок пароля показан
+                self.pw.select_range(0, "end")
+                self.pw.focus()
 
 
 # ======================================================================
