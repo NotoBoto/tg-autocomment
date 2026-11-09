@@ -25,7 +25,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, connection, events, errors, utils
 
-VERSION = "0.5.14"
+VERSION = "0.5.15"
 REPO = "NotoBoto/tg-autocomment"   # отсюда берутся обновления (GitHub Releases)
 
 # Установленная версия (.exe из установщика) хранит данные в %APPDATA% — обновление и
