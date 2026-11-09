@@ -1959,6 +1959,18 @@ class App(ctk.CTk):
         # Без нейросети заготовки не нужны: паста готова сразу
         ins_pastes = sub_au("Паста публикуется сразу под новым постом — без паузы и без очереди")
         self.publish_frames = {"delayed": dl, "instant": ins, "instant_pastes": ins_pastes}
+        # Только для «Моментально» — показывается в show_publish_mode
+        pl = self.poll_frame = ctk.CTkFrame(au, fg_color="transparent")
+        self.poll_sw = ctk.CTkSwitch(pl, text="Не ждать уведомлений Telegram — проверять каналы самим каждые")
+        self.poll_sw.grid(row=0, column=0, sticky="w", padx=14, pady=(2, 2))
+        self.poll_interval = ctk.CTkEntry(pl, width=50, justify="right")
+        self.poll_interval.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        ctk.CTkLabel(pl, text="сек").grid(row=0, column=2, sticky="w", padx=(6, 0))
+        ctk.CTkLabel(pl, text="О постах крупных каналов Telegram сообщает с опозданием — бывает, до минуты. "
+                              "С проверкой новый пост находится не позже чем через указанный интервал. "
+                              "Слишком частая проверка — Telegram может попросить подождать; 3 сек — разумно",
+                     text_color="gray", justify="left", wraplength=900).grid(
+            row=1, column=0, columnspan=3, sticky="w", padx=14, pady=(0, 10))
 
         wn = section("Программа", "Общее для всех аккаунтов")
         self.tray_sw = ctk.CTkSwitch(wn, text="При закрытии окна сворачивать в трей — программа продолжает "
@@ -2289,6 +2301,10 @@ class App(ctk.CTk):
                 f.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 6))
             else:
                 f.grid_forget()
+        if current == "delayed":
+            self.poll_frame.grid_forget()
+        else:
+            self.poll_frame.grid(row=4, column=0, columnspan=3, sticky="ew")
 
     def update_price(self):
         m = self.api_model.get()
@@ -2324,6 +2340,9 @@ class App(ctk.CTk):
         self.show_publish_mode()
         self.instant_box.delete("1.0", "end")
         self.instant_box.insert("1.0", "\n".join(c["instant_comments"]))
+        self.poll_sw.select() if c.get("poll_channels") else self.poll_sw.deselect()
+        self.poll_interval.delete(0, "end")
+        self.poll_interval.insert(0, f"{float(c.get('poll_interval_sec') or 3):g}")
         self.pastes_box.delete("1.0", "end")
         self.pastes_box.insert("1.0", "\n---\n".join(c.get("pastes", [])))
         self.update_pastes_count()
@@ -2427,6 +2446,15 @@ class App(ctk.CTk):
         if not self.conf.get("fast_unlocked"):   # «Моментально» выбирается только после пароля
             new["publish_mode"] = "delayed"
         new["instant_comments"] = [w.strip() for w in self.instant_box.get("1.0", "end").splitlines() if w.strip()]
+        new["poll_channels"] = bool(self.poll_sw.get())
+        try:
+            interval = float(self.poll_interval.get().strip().replace(",", ".") or "nan")
+        except ValueError:
+            interval = float("nan")
+        if not 1 <= interval <= 600:   # nan сюда тоже не пройдёт
+            messagebox.showerror("Настройки", "Интервал проверки каналов — от 1 до 600 секунд")
+            return False
+        new["poll_interval_sec"] = interval
         new["pastes"] = self.read_pastes()
         if new["backend"] == "pastes" and not new["pastes"]:
             messagebox.showerror("Настройки", "Для режима без нейросети нужна хотя бы одна паста")

@@ -87,6 +87,8 @@ DEFAULTS = {
     "publish_mode": "delayed",     # автоматический режим: delayed — пауза и комментарий | instant — сразу
                                    # заготовка, потом её текст заменяется сгенерированным
     "instant_comments": ["Интересно", "О, любопытно", "Хм", "Ого"],
+    "poll_channels": False,        # только при «Моментально»: не ждать уведомления Telegram, а самим
+    "poll_interval_sec": 3,        # спрашивать последний пост каналов раз в столько секунд
     "pastes": [],                  # готовые комментарии для режима без нейросети (могут быть многострочными)
     "skip_keywords": ["погиб", "умер", "скончал", "теракт", "катастроф",
                       "траур", "соболезн", "жертв", "пожар", "убит"],
@@ -1311,6 +1313,9 @@ class Engine:
         self._paste_bag: list[str] = []
         self._last_paste = ""
         self._seen_groups: dict[int, None] = {}   # альбомы, уже взятые в работу (по порядку — для чистки)
+        # Посты, уже пришедшие уведомлением или найденные опросом, — чтобы второй путь их не взял
+        self._seen_msgs: dict[tuple[int, int], None] = {}
+        self._poll_task: asyncio.Task | None = None
         self._linked: dict[int, object] = {}   # канал → его группа обсуждения (None — её нет)
         self._gen_lock: asyncio.Lock | None = None
         self._api_client = None
@@ -1412,6 +1417,9 @@ class Engine:
         if self._qr_task:
             self._qr_task.cancel()
             self._qr_task = None
+        if self._poll_task:
+            self._poll_task.cancel()
+            self._poll_task = None
         if self.client:
             await self.client.disconnect()
             self.client = None
@@ -1600,6 +1608,9 @@ class Engine:
                 await self._stop()
                 return
             self.running = True
+        if self._poll_task:
+            self._poll_task.cancel()
+        self._poll_task = asyncio.ensure_future(self._poll_channels())
         self._emit("me", me.first_name)
         self._emit("status", "running")
         self.log.info("Вошли как %s, слушаю каналы: %s", me.first_name, self._watched_titles())
@@ -1718,7 +1729,87 @@ class Engine:
         return next((k for k in self.cfg.get("skip_keywords", []) if k and k.lower() in low), None)
 
     async def _on_new_post(self, event):
-        await self._handle_post(event.message, manual=False)
+        if self._first_sight(event.message):
+            await self._handle_post(event.message, manual=False)
+
+    def _first_sight(self, msg) -> bool:
+        """Пост видим впервые? Его приносят и уведомление Telegram, и опрос — берём только первый."""
+        k = (msg.chat_id, msg.id)
+        if k in self._seen_msgs:
+            return False
+        self._seen_msgs[k] = None
+        if len(self._seen_msgs) > 2000:   # программа работает неделями — старые не нужны
+            del self._seen_msgs[next(iter(self._seen_msgs))]
+        return True
+
+    def _polling_on(self) -> bool:
+        """Опрос каналов — дополнение к моментальной публикации в автоматическом режиме."""
+        cfg = self.cfg
+        return bool(cfg.get("poll_channels") and cfg.get("publish_mode") == "instant"
+                    and not cfg.get("confirm_before_post", True))
+
+    async def _poll_channels(self):
+        """Посты крупных каналов Telegram присылает с задержкой — бывает, до минуты. При моментальной
+        публикации можно не ждать: раз в несколько секунд одним запросом узнаём номер последнего
+        сообщения в каждом канале, а новое забираем сами. Уведомления при этом работают как раньше —
+        что придёт первым, то и возьмём."""
+        last: dict[int, int] = {}   # канал → последний известный пост
+        was_on, last_error, fresh = False, "", True
+        while self.running:
+            on = self._polling_on()
+            interval = max(1.0, float(self.cfg.get("poll_interval_sec") or 3))
+            if on != was_on:
+                if on:
+                    self.log.info("Сам проверяю каналы каждые %g сек — не жду уведомлений Telegram", interval)
+                else:
+                    self.log.info("Проверка каналов выключена — новые посты по уведомлениям Telegram")
+                last.clear()   # при включении заново запомним, что уже вышло, — старое не возьмём
+                was_on, fresh = on, True
+            if on and self._watched:
+                try:
+                    await self._poll_once(last, report_missing=fresh)
+                    last_error, fresh = "", False
+                except asyncio.CancelledError:
+                    raise
+                except errors.FloodWaitError as e:
+                    self.log.warning("Проверка каналов: Telegram просит подождать %s сек — "
+                                     "увеличьте интервал проверки", e.seconds)
+                    await asyncio.sleep(e.seconds + 1)
+                    continue
+                except Exception as e:   # нет связи и т.п. — пробуем дальше, в лог одну и ту же ошибку раз
+                    if str(e) != last_error:
+                        self.log.warning("Проверка каналов не удалась: %s", e)
+                    last_error = str(e)
+            await asyncio.sleep(interval)
+
+    async def _poll_once(self, last: dict[int, int], report_missing: bool):
+        from telethon.tl import functions, types
+        ents = {utils.get_peer_id(e): e for e in self._watched.values()}
+        tops = {}
+        ids = list(ents)
+        for i in range(0, len(ids), 100):   # в одном запросе — до 100 чатов
+            res = await self.client(functions.messages.GetPeerDialogsRequest(
+                peers=[types.InputDialogPeer(utils.get_input_peer(ents[pid])) for pid in ids[i:i + 100]]))
+            tops.update({utils.get_peer_id(d.peer): d.top_message for d in res.dialogs})
+        if report_missing:
+            missing = [self._channel_title(ents[pid]) for pid in ents if pid not in tops]
+            if missing:
+                self.log.info("Не проверяю %s — аккаунт не подписан, посты придут по уведомлениям",
+                              ", ".join(missing))
+        now = datetime.now(timezone.utc)
+        for pid, top in tops.items():
+            prev = last.get(pid)
+            last[pid] = max(prev or 0, top)
+            if prev is None or top <= prev or pid not in ents:
+                continue
+            msgs = await self.client.get_messages(ents[pid], min_id=prev, limit=20)
+            for m in reversed(msgs):
+                # Старое (после долгого обрыва связи) — не спешим: придёт уведомлением, если придёт
+                if (not isinstance(m, types.Message) or (now - m.date).total_seconds() > 300
+                        or not self._first_sight(m)):
+                    continue
+                task = asyncio.ensure_future(self._handle_post(m, manual=False, polled=True))
+                task.add_done_callback(self._report_crash)
 
     def take_latest_post(self, channel: str | None = None):
         """Взять последний пост канала — удобно, чтобы проверить промпт."""
@@ -1760,7 +1851,7 @@ class Engine:
             await self._handle_post(msg, manual=True)
         self._submit(go())
 
-    async def _handle_post(self, msg, manual: bool):
+    async def _handle_post(self, msg, manual: bool, polled: bool = False):
         cfg = self.cfg
         if msg.grouped_id and not manual:
             if msg.grouped_id in self._seen_groups:   # альбом уже обрабатывается
@@ -1791,15 +1882,17 @@ class Engine:
         # или пришедший ещё раз, получит тот же ключ. Пока пост в работе — выход и обновление ждут
         self.inflight.add(key)
         try:
-            await self._take_post(msg, key, post_id, post_text, parts, manual, confirm, instant)
+            await self._take_post(msg, key, post_id, post_text, parts, manual, confirm, instant, polled)
         finally:
             self.inflight.discard(key)
 
-    async def _take_post(self, msg, key, post_id, post_text, parts, manual, confirm, instant):
+    async def _take_post(self, msg, key, post_id, post_text, parts, manual, confirm, instant, polled=False):
         cfg = self.cfg
         chan = self.channel_names.get(msg.chat_id, "")
-        # Сколько прошло с выхода поста — видно, не опаздывает ли сам Telegram с уведомлением
-        lag = "" if manual else f" (вышел {(datetime.now(timezone.utc) - msg.date).total_seconds():.0f} сек назад)"
+        # Сколько прошло с выхода поста — видно, не опаздывает ли сам Telegram с уведомлением.
+        # «нашла проверка» — пост нашёл опрос каналов раньше, чем пришло уведомление
+        lag = "" if manual else (f" (вышел {(datetime.now(timezone.utc) - msg.date).total_seconds():.0f} сек назад"
+                                 f"{', нашла проверка' if polled else ''})")
         self.log.info("Новый пост %s #%s%s: %s", chan, post_id, lag, post_text[:80].replace("\n", " "))
 
         see_images = cfg.get("send_post_images", False) and not self.no_ai
