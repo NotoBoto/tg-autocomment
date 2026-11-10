@@ -28,7 +28,7 @@ class FakeClient:
         self.msgs = {}
         self.history_calls = 0
 
-    async def __call__(self, req):
+    async def __call__(self, req, flood_sleep_threshold=None):
         return SimpleNamespace(dialogs=[SimpleNamespace(peer=types.PeerChannel(111), top_message=self.top)])
 
     async def get_messages(self, ent, min_id, limit):
@@ -107,3 +107,33 @@ def test_polling_only_with_instant_auto(engine):
     engine.cfg["publish_mode"] = "instant"
     engine.cfg["confirm_before_post"] = True
     assert not engine._polling_on()
+
+
+def test_pace_slows_on_flood_and_recovers():
+    p = core.PollPace(0.5)
+    assert p.flood(0) == 1.0
+    assert p.flood(1) == 2.0
+    assert not p.calm(1 + p.CALM_SEC - 1)     # ещё рано
+    assert p.calm(1 + p.CALM_SEC) and p.cur == 1.0
+    assert p.calm(1 + 2 * p.CALM_SEC) and p.cur == 0.5
+    assert not p.calm(1 + 3 * p.CALM_SEC) and p.cur == 0.5   # ниже заданного не опускаемся
+
+
+def test_pace_caps_and_resets_on_new_setting():
+    p = core.PollPace(0.2)
+    for _ in range(20):
+        p.flood(0)
+    assert p.cur == p.MAX_SEC
+    p.set_base(1)
+    assert p.cur == 1 and p.base == 1
+    big = core.PollPace(120)   # заданный больше потолка — реже заданного не станет и чаще тоже
+    assert big.flood(0) == 120
+
+
+def test_interval_below_one_second_allowed(engine):
+    engine.cfg["poll_interval_sec"] = 0.3
+    assert engine._poll_interval() == 0.3
+    engine.cfg["poll_interval_sec"] = 0.1
+    assert engine._poll_interval() == 0.1
+    engine.cfg["poll_interval_sec"] = 0.01
+    assert engine._poll_interval() == core.POLL_MIN_SEC

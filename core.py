@@ -138,6 +138,36 @@ MEDIA_FORBIDDEN = (errors.ChatSendMediaForbiddenError, errors.ChatSendPhotosForb
 
 # «Моментально» и паузы короче MIN_DELAY_SEC — по паролю: в открытом коде лежит только его хэш
 MIN_DELAY_SEC = 5
+POLL_MIN_SEC = 0.1  # проверка каналов (poll_interval_sec) — не чаще
+
+
+class PollPace:
+    """Темп проверки каналов. Telegram попросил подождать — проверяем вдвое реже; CALM_SEC без таких
+    просьб — вдвое чаще, пока не вернёмся к заданному интервалу."""
+    MAX_SEC = 60.0
+    CALM_SEC = 120.0
+
+    def __init__(self, base: float):
+        self.base = self.cur = base
+        self.calm_since = time.monotonic()
+
+    def set_base(self, base: float):
+        if base != self.base:   # интервал поменяли в настройках — начинаем с него
+            self.base = self.cur = base
+            self.calm_since = time.monotonic()
+
+    def flood(self, now: float) -> float:
+        self.cur = max(self.base, min(self.MAX_SEC, self.cur * 2))
+        self.calm_since = now
+        return self.cur
+
+    def calm(self, now: float) -> bool:
+        """Проверка прошла без просьб подождать. True — интервал только что уменьшили."""
+        if self.cur <= self.base or now - self.calm_since < self.CALM_SEC:
+            return False
+        self.cur = max(self.base, self.cur / 2)
+        self.calm_since = now
+        return True
 FAST_SALT = bytes.fromhex("00a3e487fecaf4139bca83589943d2da")
 FAST_HASH = bytes.fromhex("7fa2d7754180f32bc65c04c0a1a3d8b84898d31ff06e3515296fa62bcad0d188")
 FAST_ITERATIONS = 600_000   # медленный хэш — перебирать пароль дольше
@@ -1755,12 +1785,13 @@ class Engine:
         что придёт первым, то и возьмём."""
         last: dict[int, int] = {}   # канал → последний известный пост
         was_on, last_error, fresh = False, "", True
+        pace = PollPace(self._poll_interval())
         while self.running:
             on = self._polling_on()
-            interval = max(1.0, float(self.cfg.get("poll_interval_sec") or 3))
+            pace.set_base(self._poll_interval())
             if on != was_on:
                 if on:
-                    self.log.info("Сам проверяю каналы каждые %g сек — не жду уведомлений Telegram", interval)
+                    self.log.info("Сам проверяю каналы каждые %g сек — не жду уведомлений Telegram", pace.base)
                 else:
                     self.log.info("Проверка каналов выключена — новые посты по уведомлениям Telegram")
                 last.clear()   # при включении заново запомним, что уже вышло, — старое не возьмём
@@ -1769,18 +1800,28 @@ class Engine:
                 try:
                     await self._poll_once(last, report_missing=fresh)
                     last_error, fresh = "", False
+                    if pace.calm(time.monotonic()):
+                        self.log.info("Проверка каналов: снова каждые %g сек", pace.cur)
                 except asyncio.CancelledError:
                     raise
                 except errors.FloodWaitError as e:
-                    self.log.warning("Проверка каналов: Telegram просит подождать %s сек — "
-                                     "увеличьте интервал проверки", e.seconds)
+                    slower = pace.flood(time.monotonic())
+                    self.log.warning("Проверка каналов: Telegram просит подождать %s сек — дальше проверяю "
+                                     "каждые %g сек, через пару минут без таких просьб снова чаще",
+                                     e.seconds, slower)
                     await asyncio.sleep(e.seconds + 1)
                     continue
                 except Exception as e:   # нет связи и т.п. — пробуем дальше, в лог одну и ту же ошибку раз
                     if str(e) != last_error:
                         self.log.warning("Проверка каналов не удалась: %s", e)
                     last_error = str(e)
-            await asyncio.sleep(interval)
+            await asyncio.sleep(pace.cur)
+
+    def _poll_interval(self) -> float:
+        try:
+            return max(POLL_MIN_SEC, float(self.cfg.get("poll_interval_sec") or 3))
+        except (TypeError, ValueError):
+            return 3.0
 
     async def _poll_once(self, last: dict[int, int], report_missing: bool):
         from telethon.tl import functions, types
@@ -1788,8 +1829,11 @@ class Engine:
         tops = {}
         ids = list(ents)
         for i in range(0, len(ids), 100):   # в одном запросе — до 100 чатов
+            # flood_sleep_threshold=0: иначе Telethon молча ждёт FloodWait до минуты, и мы не узнаём,
+            # что проверять надо реже
             res = await self.client(functions.messages.GetPeerDialogsRequest(
-                peers=[types.InputDialogPeer(utils.get_input_peer(ents[pid])) for pid in ids[i:i + 100]]))
+                peers=[types.InputDialogPeer(utils.get_input_peer(ents[pid])) for pid in ids[i:i + 100]]),
+                flood_sleep_threshold=0)
             tops.update({utils.get_peer_id(d.peer): d.top_message for d in res.dialogs})
         if report_missing:
             missing = [self._channel_title(ents[pid]) for pid in ents if pid not in tops]

@@ -1968,7 +1968,9 @@ class App(ctk.CTk):
         ctk.CTkLabel(pl, text="сек").grid(row=0, column=2, sticky="w", padx=(6, 0))
         ctk.CTkLabel(pl, text="О постах крупных каналов Telegram сообщает с опозданием — бывает, до минуты. "
                               "С проверкой новый пост находится не позже чем через указанный интервал. "
-                              "Слишком частая проверка — Telegram может попросить подождать; 3 сек — разумно",
+                              f"Можно чаще секунды, от {core.POLL_MIN_SEC:g} сек (например, 0,5). "
+                              "Если Telegram попросит подождать, программа сама станет проверять реже, "
+                              "а через пару минут спокойной работы вернётся к указанному интервалу",
                      text_color="gray", justify="left", wraplength=900).grid(
             row=1, column=0, columnspan=3, sticky="w", padx=14, pady=(0, 10))
 
@@ -2451,8 +2453,9 @@ class App(ctk.CTk):
             interval = float(self.poll_interval.get().strip().replace(",", ".") or "nan")
         except ValueError:
             interval = float("nan")
-        if not 1 <= interval <= 600:   # nan сюда тоже не пройдёт
-            messagebox.showerror("Настройки", "Интервал проверки каналов — от 1 до 600 секунд")
+        if not core.POLL_MIN_SEC <= interval <= 600:   # nan сюда тоже не пройдёт
+            messagebox.showerror("Настройки", f"Интервал проверки каналов — от {core.POLL_MIN_SEC:g} "
+                                              "до 600 секунд (дробное — через запятую: 0,5)")
             return False
         new["poll_interval_sec"] = interval
         new["pastes"] = self.read_pastes()
